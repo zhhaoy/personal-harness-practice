@@ -4,8 +4,6 @@
 
 > 每一章对应的 `.py` 文件均可直接运行，并附带一组验证问题，帮助理解每个新特性的行为。
 
----
-
 ## ✨ 特性概览
 
 - ✅ **核心循环** – 纯工具驱动的 Agent Loop，LLM 自主决定何时退出。
@@ -19,27 +17,25 @@
 - 🧠 **自主智能体** – 队友自动轮询任务看板，认领未分配任务。
 - 🔒 **任务隔离** – 每个任务独立 Git worktree，并行工作永不冲突，全生命周期可审计。
 
----
 
 ## 📁 项目结构
 .
-├── agents/ # 10 章渐进式脚本（01 至 10）
-│ ├── 01-agent_loop.py
-│ ├── 02-agent_loop.py
-│ ├── ...
-│ └── 10-agent_loop.py # 最终完整版
-├── design/ # 设计文档
-│ └── 01-10 完整需求文档.md
-├── skills/ # 可选技能目录（SKILL.md）
-│ └── example/
-│ └── SKILL.md
-├── .env.example # 环境变量模板
+├── agents/                      # 10 章渐进式脚本（01 至 10）
+│   ├── 01-agent_loop.py
+│   ├── 02-agent_loop.py
+│   ├── ...
+│   └── 10-agent_loop.py         # 最终完整版
+├── design/                      # 设计文档
+│   └── 01-10 完整需求文档.md
+├── skills/                      # 可选技能目录（SKILL.md）
+│   └── example/
+│       └── SKILL.md
+├── .env.example                 # 环境变量模板
 ├── .gitignore
 ├── requirements.txt
 ├── LICENSE
 └── README.md
 
----
 
 ## 🚀 快速开始
 
@@ -143,3 +139,12 @@ python agents/10-agent_loop.py
 - 队友线程的后台运行依赖于 Python 的 `threading`，轻量且无额外依赖。
 - 所有压缩的对话转录保存在 `.transcripts/`，任务板在 `.tasks/`，工作树在 `.worktrees/`，团队配置在 `.team/`，均可安全删除（不影响工作区代码）。
 - 环境变量需正确配置，默认使用 OpenAI 兼容的 API。
+
+## 📄 许可证
+
+本项目采用 MIT 许可证，你可以自由使用、修改和分发。
+
+## 🙏 致谢
+
+- learn-claude-code：提供了优秀的设计思路和迭代式教学方式。
+- GLM / DeepSeek / Qwen 等开源模型社区。
