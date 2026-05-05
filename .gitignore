@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.env
+
+# 本项目生成的运行时数据
+.transcripts/
+.team/
+.tasks/
+.worktrees/
+
+# 临时文件
+*.log
+*.tmp
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
