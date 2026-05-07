@@ -1,13 +1,17 @@
 # 🤖 Personal Harness — 多智能体自主协作框架
 
-本项目参照 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 设计，实现了一个**增量式**的个人开发工具链。通过 10 个循序渐进的 Python 脚本，逐步引入了上下文压缩、后台任务、队友团队、自主智能体以及基于 Git Worktree 的任务隔离等机制。
+本项目参考 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 项目，实现了一个**增量式**的个人 Agent Harness。
 
-> 每一章对应的 `.py` 文件均可直接运行，并附带一组验证问题，帮助理解每个新特性的行为。
+design/ 文件夹存放需求文件，内含10个章节，每个章节对应一个Harness机制，同时每章节又对应一个处于 agents/ 文件夹下的可执行 Python 脚本。
+
+通过这 10 个循序渐进的 Python 脚本，逐步引入了上下文压缩、后台任务、队友团队、自主智能体以及基于 Git Worktree 的任务隔离等机制、概念，最终形成较为完整的、Harness范式的 Agent 项目工程。
+
+> 每一章对应的 `.py` 文件均可直接运行（增量式开发），并附带一组验证问题，帮助理解每个新机制的行为。
 
 ## ✨ 特性概览
 
 - ✅ **核心循环** – 纯工具驱动的 Agent Loop，LLM 自主决定何时退出。
-- 🔧 **工具矩阵** – 路径沙箱化、工具与函数映射，安全且易扩展。
+- 🔧 **工具矩阵** – 路径沙箱化、工具与函数映射，安全且易维护。
 - 📋 **ToDo 规划** – 引导 Agent 先规划、再执行，避免遗忘长程目标。
 - 🧩 **子代理/任务** – 上下文隔离的子任务，防止主流程被干扰。
 - 📚 **渐进式技能** – 按需加载 `skills/` 中的 Markdown 技能（SKILL.md）。
@@ -19,22 +23,27 @@
 
 
 ## 📁 项目结构
+```text
 .
 ├── agents/                      # 10 章渐进式脚本（01 至 10）
 │   ├── 01-agent_loop.py
 │   ├── 02-agent_loop.py
 │   ├── ...
 │   └── 10-agent_loop.py         # 最终完整版
-├── design/                      # 设计文档
+├── design/                      # 10 章设计文档
 │   └── 01-10 完整需求文档.md
 ├── skills/                      # 可选技能目录（SKILL.md）
 │   └── example/
 │       └── SKILL.md
+├── ready-to-go-withUI/          # 带UI、可直接运行的案例
+│   ├── agent_loop.py            # 即前述 10-agent_loop.py
+│   └── web_ui.py                # UI实现，可直接接口、导入 agent_loop.py
 ├── .env.example                 # 环境变量模板
 ├── .gitignore
 ├── requirements.txt
 ├── LICENSE
 └── README.md
+```
 
 
 ## 🚀 快速开始
@@ -57,12 +66,14 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 .env 文件：
+编辑 .env 文件，以智谱为例：
 ```ini
-LLM_API_BASE=https://api.your-service.com/v1
-LLM_API_KEY=sk-xxxxxx
-LLM_MODEL=your-model-name
+LLM_API_BASE=https://open.bigmodel.cn/api/paas/v4/
+LLM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+LLM_MODEL=GLM-5.x
 ```
+
+或直接在环境变量中新增上述三个变量，简单易行。
 
 ### 4. 运行某一章脚本
 例如运行最终完整版：
@@ -139,6 +150,12 @@ python agents/10-agent_loop.py
 - 队友线程的后台运行依赖于 Python 的 `threading`，轻量且无额外依赖。
 - 所有压缩的对话转录保存在 `.transcripts/`，任务板在 `.tasks/`，工作树在 `.worktrees/`，团队配置在 `.team/`，均可安全删除（不影响工作区代码）。
 - 环境变量需正确配置，默认使用 OpenAI 兼容的 API。
+
+## 立即使用 - 一个带UI的直接可执行项目
+
+ready-to-go-withUI/ 文件夹下有两个文件，agent_loop.py 和 web_ui.py ，两个文件即本项目所有所需，将两个文件放在同一目录下，运行 web_ui.py 即可。
+
+该项目会生成一个简便优雅的 web 界面，是个对话界面，用户可在其中与 Agent 对话。
 
 ## 📄 许可证
 
