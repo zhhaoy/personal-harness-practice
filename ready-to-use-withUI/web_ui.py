@@ -3,12 +3,14 @@
 Web UI for PDM Agent – 支持实时工具调用、流式输出、会话持久化、深色模式
 增加心跳保持连接，集成队友消息回调与折叠显示
 工具调用显示为统一可折叠面板（位于回复框上方）
+可插拔工具 DIY 区域：支持启用/禁用内置工具，创建/编辑/删除自定义工具
 """
 
 import os
 import threading
 import queue
 import json
+import traceback
 from datetime import datetime
 from nicegui import ui, app
 
@@ -17,9 +19,13 @@ os.environ["WEBSOCKET_PING_INTERVAL"] = "20"
 os.environ["WEBSOCKET_PING_TIMEOUT"] = "60"
 
 try:
-    from agent_loop import agent_loop, AgentResult, set_teammate_callback
+    from agent_loop import (
+        agent_loop, AgentResult, set_teammate_callback,
+        registry, run_spawn_teammate, run_list_teammates,  # 用于后端操作
+        CUSTOM_TOOLS_DIR, WORKDIR
+    )
 except ImportError:
-    print("错误: 无法导入 pdm_main.py，请确保文件在同一目录下。")
+    print("错误: 无法导入 agent_loop.py，请确保文件在同一目录下。")
     exit(1)
 
 # ---------- 全局状态 ----------
@@ -112,6 +118,13 @@ def refresh_teammate_panel():
     except Exception as e:
         print(f"刷新队友面板失败: {e}")
 
+def refresh_tool_diy_panel():
+    """刷新工具DIY面板"""
+    try:
+        tool_diy_panel.refresh()
+    except Exception as e:
+        print(f"刷新工具DIY面板失败: {e}")
+
 def add_teammate_message(teammate_name: str, subtype: str, data: dict):
     """添加队友消息，并刷新队友面板"""
     if subtype == "assistant":
@@ -138,6 +151,123 @@ def add_teammate_message(teammate_name: str, subtype: str, data: dict):
     # 只刷新队友面板，主聊天区不显示队友消息
     refresh_teammate_panel()
 
+# ---------- 工具DIY 相关函数 ----------
+def get_builtin_tools():
+    """获取内置工具列表（从注册表）"""
+    tools = registry.list_tools()
+    return [t for t in tools if t.get("builtin")]
+
+def get_custom_tools():
+    """获取自定义工具列表"""
+    tools = registry.list_tools()
+    return [t for t in tools if not t.get("builtin") and t.get("editable")]
+
+def toggle_tool_enable(tool_name: str, enable: bool):
+    """启用/禁用工具"""
+    if enable:
+        registry.enable(tool_name)
+    else:
+        registry.disable(tool_name)
+    refresh_tool_diy_panel()
+    ui.notify(f"工具 {tool_name} 已{'启用' if enable else '禁用'}", type="info")
+
+def get_custom_tool_code(tool_name: str) -> str:
+    """获取自定义工具代码"""
+    # 从注册表获取代码（存储在 _tools 的 code 字段中）
+    # 由于 registry 未直接暴露 code，我们通过读取文件获取
+    meta_path = CUSTOM_TOOLS_DIR / "custom_tools.json"
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as f:
+            tools_data = json.load(f)
+        for t in tools_data:
+            if t.get("name") == tool_name:
+                return t.get("code", "")
+    return ""
+
+def update_custom_tool(name: str, code: str, description: str = None, enabled: bool = None):
+    """更新自定义工具"""
+    # 需要解析代码获取 description 和 parameters？这里简化，仅更新代码，保留原有的 description 和 parameters
+    # 更好的方式：从代码中自动提取参数 schema，复杂，先保持简单
+    if not description:
+        # 默认描述
+        description = f"自定义工具: {name}"
+    # 简单参数 schema，假设工具接受任意参数
+    parameters = {"type": "object", "properties": {}, "additionalProperties": True}
+    # 调用 registry.update_custom_tool
+    success = registry.update_custom_tool(name, description=description, parameters=parameters, code=code, enabled=enabled)
+    if success:
+        refresh_tool_diy_panel()
+        ui.notify(f"工具 {name} 已更新", type="positive")
+    else:
+        ui.notify(f"更新工具 {name} 失败", type="negative")
+
+def delete_custom_tool(name: str):
+    """删除自定义工具"""
+    success = registry.delete_custom_tool(name)
+    if success:
+        refresh_tool_diy_panel()
+        ui.notify(f"工具 {name} 已删除", type="positive")
+    else:
+        ui.notify(f"删除工具 {name} 失败", type="negative")
+
+def create_custom_tool_from_requirement(requirement: str):
+    """根据自然语言需求，调用 LLM 生成自定义工具代码"""
+    from agent_loop import MultiModelClient
+    llm = MultiModelClient()
+    prompt = f"""你是一个工具生成器。根据用户的需求，生成一个完整的 Python 函数，函数名必须为 execute，接收一个字典参数 args，返回字符串。
+用户需求: {requirement}
+
+要求：
+- 函数签名: def execute(args: dict) -> str
+- 不要包含危险操作（如文件删除、系统命令执行等）
+- 可以导入标准库模块：json, re, math, datetime, random, itertools, collections
+- 代码必须安全、可执行
+- 返回的结果应该是字符串，不要输出额外的解释。
+
+现在只输出代码，不要包含其他文字。代码应该以 ```python 开头或直接输出代码。"""
+
+    try:
+        resp = llm._chat_no_stream([{"role": "user", "content": prompt}], [])
+        content = resp.get("content", "")
+        # 提取代码块
+        code = content
+        if "```python" in content:
+            code = content.split("```python")[1].split("```")[0].strip()
+        elif "```" in content:
+            code = content.split("```")[1].split("```")[0].strip()
+        # 验证代码
+        # 简单检查是否包含 execute 函数
+        if "def execute" not in code:
+            ui.notify("生成的代码缺少 execute 函数，请重新尝试", type="warning")
+            return None
+        # 弹出对话框让用户确认/编辑
+        with ui.dialog() as dialog, ui.card():
+            ui.label("生成的工具代码，请确认或编辑后保存").classes("text-lg font-bold")
+            code_input = ui.textarea(value=code, placeholder="Python 代码...").classes("w-full h-80 font-mono")
+            name_input = ui.input(label="工具名称", placeholder="my_tool").classes("w-full")
+            def do_save():
+                tool_name = name_input.value.strip()
+                if not tool_name:
+                    ui.notify("请输入工具名称", type="warning")
+                    return
+                # 保存工具
+                success = registry.add_custom_tool(tool_name, f"自定义工具: {tool_name}",
+                                                   {"type": "object", "properties": {}, "additionalProperties": True},
+                                                   code_input.value, enabled=True)
+                if success:
+                    ui.notify(f"工具 {tool_name} 已创建", type="positive")
+                    refresh_tool_diy_panel()
+                    dialog.close()
+                else:
+                    ui.notify("工具创建失败，请检查代码安全性", type="negative")
+            ui.button("保存", on_click=do_save).props("color=primary")
+            ui.button("取消", on_click=dialog.close).props("flat")
+        dialog.open()
+        return code
+    except Exception as e:
+        ui.notify(f"生成失败: {str(e)}", type="negative")
+        return None
+
 # ---------- 回调函数 ----------
 def tool_callback(tool_name: str, args: dict, output: str):
     result_queue.put({
@@ -154,7 +284,7 @@ def stream_callback(fragment: str):
     })
 
 def teammate_callback(teammate_name: str, subtype: str, data: dict):
-    """由 pdm_main 调用的队友消息回调"""
+    """由 agent_loop 调用的队友消息回调"""
     result_queue.put({
         "type": "teammate",
         "name": teammate_name,
@@ -175,7 +305,7 @@ def run_agent_in_thread(prompt: str):
             "tool_calls": result.tool_calls
         })
     except Exception as e:
-        result_queue.put({"type": "error", "content": str(e)})
+        result_queue.put({"type": "error", "content": str(e) + "\n" + traceback.format_exc()})
     finally:
         is_running = False
         heartbeat_stop.set()
@@ -323,6 +453,60 @@ def tool_panel():
                         output_preview += "..."
                     ui.markdown(f"输出: ```\n{output_preview}\n```").classes("text-xs")
 
+# ---------- 工具 DIY 面板 ----------
+@ui.refreshable
+def tool_diy_panel():
+    """可插拔工具管理面板：内置工具开关 + 自定义工具编辑/创建"""
+    with ui.card().classes("w-full max-w-4xl mx-auto mb-2 shadow-lg"):
+        ui.label("🔧 工具管理 (DIY)").classes("text-lg font-bold")
+        # 不可编辑的内置工具部分
+        ui.label("内置工具 (不可编辑代码)").classes("text-md font-semibold mt-2")
+        builtins = get_builtin_tools()
+        with ui.row().classes("flex-wrap gap-2"):
+            for tool in builtins:
+                name = tool["name"]
+                enabled = tool["enabled"]
+                with ui.card().tight().classes("p-2").props("flat bordered"):
+                    ui.label(name).classes("text-sm font-mono")
+                    ui.switch(value=enabled, on_change=lambda e, n=name: toggle_tool_enable(n, e.value)).props("dense")
+        ui.separator()
+        # 可编辑的自定义工具部分
+        ui.label("自定义工具 (可编辑代码)").classes("text-md font-semibold mt-2")
+        custom_tools = get_custom_tools()
+        if custom_tools:
+            for tool in custom_tools:
+                name = tool["name"]
+                enabled = tool["enabled"]
+                with ui.expansion(text=f"📦 {name}", icon="code").classes("w-full").props("dense"):
+                    with ui.column().classes("p-2"):
+                        # 获取代码
+                        code = get_custom_tool_code(name)
+                        code_edit = ui.textarea(value=code, label="Python代码", placeholder="def execute(args: dict) -> str: ...").classes("w-full h-64 font-mono")
+                        # 开关
+                        ui.switch(value=enabled, label="启用", on_change=lambda e, n=name: toggle_tool_enable(n, e.value))
+                        # 保存按钮
+                        def save_tool(n=name, code_widget=code_edit):
+                            new_code = code_widget.value
+                            # 简单验证
+                            if "def execute" not in new_code:
+                                ui.notify("代码必须包含 execute 函数", type="warning")
+                                return
+                            # 更新工具
+                            update_custom_tool(n, new_code, description=f"自定义工具: {n}", enabled=enabled)
+                        ui.button("保存", on_click=save_tool).props("color=primary")
+                        # 删除按钮
+                        def delete_tool(n=name):
+                            delete_custom_tool(n)
+                        ui.button("删除", on_click=delete_tool).props("color=negative")
+        else:
+            ui.label("暂无自定义工具，点击下方按钮创建").classes("text-gray-400")
+
+        # 创建新工具区域
+        ui.label("创建自定义工具").classes("text-md font-semibold mt-2")
+        with ui.row().classes("gap-2 items-center"):
+            requirement_input = ui.input(placeholder="请输入工具需求，例如: 获取当前北京时间").classes("flex-grow")
+            ui.button("生成工具", on_click=lambda: create_custom_tool_from_requirement(requirement_input.value)).props("color=positive")
+
 def clear_history():
     global messages, tool_calls_history, CURRENT_ASSISTANT_MSG_INDEX
     messages = [{
@@ -343,9 +527,10 @@ def toggle_dark_mode():
     ui.update()
 
 input_field = None
+drawer = None
 
 def create_ui():
-    global input_field
+    global input_field, drawer
     ui.page_title("PDM Agent – 任务隔离助手")
 
     dark_mode_saved = app.storage.user.get('dark_mode', False)
@@ -355,12 +540,19 @@ def create_ui():
         ui.label("PDM Agent").classes("text-xl font-bold")
         ui.label("基于 Git Worktree 的任务隔离助手").classes("text-sm opacity-80")
         ui.space()
+        # 工具DIY按钮
+        ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white")
         ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white")
+
+    # 右侧可滑动抽屉（工具DIY区域）
+    with ui.right_drawer(fixed=False, value=False).classes("bg-gray-100 dark:bg-gray-900 p-4 w-96") as drawer:
+        ui.label("工具DIY区域").classes("text-xl font-bold mb-4")
+        tool_diy_panel()
 
     with ui.column().classes("w-full items-center"):
         ui_chat()
         tool_panel()
-        teammate_panel()   # 添加队友面板
+        teammate_panel()
 
     with ui.footer().classes("bg-gray-100 dark:bg-gray-900 p-4"):
         with ui.row().classes("w-full max-w-4xl mx-auto gap-2"):
