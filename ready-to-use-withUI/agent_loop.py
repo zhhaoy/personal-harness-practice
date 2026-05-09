@@ -925,6 +925,7 @@ class TeammateManager:
             f"当收到 shutdown_request 时，请调用 shutdown_response 工具响应（approve 表示同意关机）。\n"
             f"对于重大更改，请先使用 plan_approval 工具提交计划给 lead，等待批准。\n"
             f"每个工作阶段最多调用 {MAX_TOOL_CALLS_PER_PHASE} 次工具，超过将强制进入 idle 。"
+            f"检查是否已经使用 send_message 给 Lead Agent 发送任务已完成的信息！"
         )
         teammate_tools_def = [
             {"type": "function", "function": {"name": "bash", "description": "执行Shell命令",
@@ -2109,7 +2110,7 @@ def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Op
                 BUS.clear_inbox("lead")
                 wait_until = 0
             else:
-                time.sleep(1)
+                time.sleep(5)
                 continue
         else:
             wait_until = 0
@@ -2266,6 +2267,12 @@ def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Op
                 wait_until = time.time() + 120
             elif tool_name == "spawn_teammate":
                 wait_until = time.time() + 10
+
+            if tool_name == "task_create":
+                # 创建任务后，队友可能自动认领并回复，给予短暂等待
+                wait_until = time.time() + 120
+            elif tool_name == "task_update" and args.get("owner") in TEAM.member_names():
+                wait_until = time.time() + 15
 
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 
