@@ -832,6 +832,447 @@ class MessageBus:
 
 BUS = MessageBus(INBOX_DIR)
 
+# ========== TeammateManager (队友线程，使用任务+工作树机制) ==========
+import uuid  # 确保已导入
+
+class TeammateManager:
+    def __init__(self, team_dir: Path):
+        self.dir = team_dir
+        self.dir.mkdir(exist_ok=True)
+        (self.dir / "inbox").mkdir(exist_ok=True)
+        self.config_path = self.dir / "config.json"
+        self.config = self._load_config()
+        self._reset_all_to_shutdown()
+        self.threads: Dict[str, threading.Thread] = {}
+
+    def _reset_all_to_shutdown(self):
+        changed = False
+        for member in self.config.get("members", []):
+            if member.get("status") != "shutdown":
+                member["status"] = "shutdown"
+                changed = True
+        if changed:
+            self._save_config()
+
+    def _load_config(self) -> dict:
+        if self.config_path.exists():
+            return json.loads(self.config_path.read_text(encoding="utf-8"))
+        return {"team_name": "default", "members": []}
+
+    def _save_config(self):
+        self.config_path.write_text(json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _find_member(self, name: str) -> Optional[dict]:
+        for m in self.config["members"]:
+            if m["name"] == name:
+                return m
+        return None
+
+    def spawn(self, name: str, role: str, prompt: str) -> str:
+        member = self._find_member(name)
+        if member:
+            if member["status"] not in ("idle", "shutdown"):
+                return f"错误: '{name}' 当前状态为 {member['status']}"
+            member["status"] = "working"
+            member["role"] = role
+            member["prompt"] = prompt
+        else:
+            member = {"name": name, "role": role, "status": "working", "prompt": prompt}
+            self.config["members"].append(member)
+        self._save_config()
+        if name in self.threads and self.threads[name].is_alive():
+            return f"错误: 队友 '{name}' 的旧线程仍在运行"
+        thread = threading.Thread(target=self._autonomous_loop, args=(name, role, prompt, []), daemon=True)
+        self.threads[name] = thread
+        thread.start()
+        return f"已生成自主队友 '{name}' (角色: {role})"
+
+    def activate(self, name: str) -> str:
+        member = self._find_member(name)
+        if not member:
+            return f"错误: 未知队友 '{name}'，请先使用 spawn_teammate 创建。"
+        if member["status"] != "shutdown":
+            return f"错误: 队友 '{name}' 状态为 {member['status']}，无法激活（只有 shutdown 状态可激活）。"
+        if name in self.threads and self.threads[name].is_alive():
+            return f"错误: 队友 '{name}' 的线程仍在运行，请等待其自然停止或手动清理。"
+        history = BUS.read_inbox(name)
+        role = member.get("role", "worker")
+        prompt = member.get("prompt", "请继续你的工作。")
+        member["status"] = "working"
+        self._save_config()
+        thread = threading.Thread(target=self._autonomous_loop, args=(name, role, prompt, history), daemon=True)
+        self.threads[name] = thread
+        thread.start()
+        return f"已激活队友 '{name}' (角色: {role})，已加载 {len(history)} 条历史收件消息。"
+
+    def _autonomous_loop(self, name: str, role: str, prompt: str, initial_inbox_history: List[Dict]):
+        team_name = self.config["team_name"]
+        sys_prompt = (
+            f"你是队友 '{name}'，角色: {role}，团队: {team_name}，工作目录: {WORKDIR}，操作系统: {OS_INFO}。！！需使用适配该操作系统的bash命令！！ \n"
+            f"你可以使用以下工具：\n"
+            f"  - 基础文件: read_file, write_file, edit_file, bash\n"
+            f"  - 任务管理: task_create, task_list, task_get, task_update, task_bind_worktree\n"
+            f"  - 工作树隔离: worktree_create, worktree_list, worktree_status, worktree_run, worktree_keep, worktree_remove, worktree_events\n"
+            f"  - 通信工具: send_message, read_inbox, shutdown_response, plan_approval, idle\n"
+            f"工作流程建议：\n"
+            f"1. 从任务板认领任务：使用 task_list 查看 pending 任务，然后 task_update 设置 owner 为自己，状态为 in_progress。\n"
+            f"2. 使用 send_message 给 Lead Agent 发送任务已被领取，正在执行 的信息。\n"
+            f"3. 为任务创建工作树：worktree_create name=<任务名> task_id=<任务ID> base_ref=HEAD\n"
+            f"4. 在工作树中执行修改：worktree_run name=<任务名> command=\"...\"\n"
+            f"5. 任务完成后，使用 worktree_remove name=<任务名> complete_task=true 自动清理并标记完成。\n"
+            f"6. 任务完成后，必须使用 send_message 给 Lead Agent 发送任务已完成的信息。 \n"
+            f"7. 当没有更多工作时，调用 idle 工具进入空闲状态。空闲时会自动轮询收件箱和任务板。\n"
+            f"当收到 shutdown_request 时，请调用 shutdown_response 工具响应（approve 表示同意关机）。\n"
+            f"对于重大更改，请先使用 plan_approval 工具提交计划给 lead，等待批准。\n"
+            f"每个工作阶段最多调用 {MAX_TOOL_CALLS_PER_PHASE} 次工具，超过将强制进入 idle 。"
+        )
+        teammate_tools_def = [
+            {"type": "function", "function": {"name": "bash", "description": "执行Shell命令",
+             "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+            {"type": "function", "function": {"name": "read_file", "description": "读取文件",
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+            {"type": "function", "function": {"name": "write_file", "description": "写入文件",
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+            {"type": "function", "function": {"name": "edit_file", "description": "编辑文件",
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}}},
+            {"type": "function", "function": {"name": "send_message", "description": "发送消息给队友或lead",
+             "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": ["message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"]}}, "required": ["to", "content"]}}},
+            {"type": "function", "function": {"name": "read_inbox", "description": "读取并清空自己的收件箱",
+             "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "shutdown_response", "description": "响应 shutdown 请求",
+             "parameters": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}}},
+            {"type": "function", "function": {"name": "plan_approval", "description": "向 lead 提交需要批准的计划",
+             "parameters": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}}},
+            {"type": "function", "function": {"name": "idle", "description": "通知系统进入空闲状态",
+             "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "task_create", "description": "创建新任务",
+             "parameters": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}}},
+            {"type": "function", "function": {"name": "task_list", "description": "列出所有任务",
+             "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "task_get", "description": "获取任务详情",
+             "parameters": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}}},
+            {"type": "function", "function": {"name": "task_update", "description": "更新任务状态或所有者",
+             "parameters": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "owner": {"type": "string"}}, "required": ["task_id"]}}},
+            {"type": "function", "function": {"name": "task_bind_worktree", "description": "绑定任务到工作树",
+             "parameters": {"type": "object", "properties": {"task_id": {"type": "integer"}, "worktree": {"type": "string"}, "owner": {"type": "string"}}, "required": ["task_id", "worktree"]}}},
+            {"type": "function", "function": {"name": "worktree_create", "description": "创建 git worktree 并可选绑定任务",
+             "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "task_id": {"type": "integer"}, "base_ref": {"type": "string"}}, "required": ["name"]}}},
+            {"type": "function", "function": {"name": "worktree_list", "description": "列出所有工作树",
+             "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "worktree_status", "description": "显示工作树 git 状态",
+             "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
+            {"type": "function", "function": {"name": "worktree_run", "description": "在工作树中运行命令",
+             "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "command": {"type": "string"}}, "required": ["name", "command"]}}},
+            {"type": "function", "function": {"name": "worktree_keep", "description": "将工作树标记为保留",
+             "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
+            {"type": "function", "function": {"name": "worktree_remove", "description": "删除工作树并可选完成任务",
+             "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, "required": ["name"]}}},
+            {"type": "function", "function": {"name": "worktree_events", "description": "查看生命周期事件", "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}}}},
+        ]
+
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        if initial_inbox_history:
+            for msg in initial_inbox_history:
+                inbox_block = f"<inbox>\n{json.dumps(msg, indent=2, ensure_ascii=False)}\n</inbox>"
+                messages.append({"role": "user", "content": inbox_block})
+            print(f"\033[36m[队友 {name}] 已加载 {len(initial_inbox_history)} 条历史收件消息\033[0m")
+
+        client = MultiModelClient()
+        global_step = 0
+        total_tool_calls = 0
+        pending_plan_request_id = None
+        error_count = 0
+        last_tool_signature = ""
+        similar_count = 0
+
+        while True:
+            global_step += 1            
+            phase_tool_calls = 0
+            idle_requested = False
+
+            for _ in range(50):
+                inbox = BUS.read_inbox(name)
+                if inbox:
+                    for msg in inbox:
+                        if msg.get("type") == "plan_approval_response":
+                            req_id = msg.get("request_id")
+                            approve = msg.get("approve")
+                            feedback = msg.get("feedback", "")
+                            if approve is True:
+                                pending_plan_request_id = None
+                                messages.append({
+                                    "role": "user",
+                                    "content": f"<system-approval>\n你的计划已被 lead 批准！反馈: {feedback}\n请立即执行计划中的具体操作。\n</system-approval>"
+                                })
+                            else:
+                                pending_plan_request_id = None
+                                messages.append({
+                                    "role": "user",
+                                    "content": f"<system-rejection>\n你的计划被 lead 拒绝。反馈: {feedback}\n请修改计划或停止。\n</system-rejection>"
+                                })
+                        else:
+                            messages.append({"role": "user", "content": f"<inbox>\n{json.dumps(msg, indent=2, ensure_ascii=False)}\n</inbox>"})
+                    BUS.clear_inbox(name)
+
+                resp = client._chat_no_stream(messages, teammate_tools_def)
+                if resp.get("error"):
+                    print(f"\033[36m[队友 {name}] 模型错误: {resp['error']}\033[0m")
+                    error_count += 1
+                    if error_count >= 3:
+                        print(f"\033[36m[队友 {name}] 连续错误过多，强制退出\033[0m")
+                        self._set_status(name, "shutdown")
+                        return
+                    time.sleep(5)
+                    continue
+                error_count = 0
+
+                assistant_msg = {"role": "assistant", "content": resp["content"]}
+                if resp["tool_calls"]:
+                    assistant_msg["tool_calls"] = [
+                        {"id": tc["id"], "type": tc["type"], "function": tc["function"]}
+                        for tc in resp["tool_calls"]
+                    ]
+                messages.append(assistant_msg)
+
+                if not resp["tool_calls"]:
+                    if resp["content"]:
+                        print(f"\033[36m[队友 {name}] 说: {resp['content'][:200]}\033[0m")
+                        if TEAMMATE_CALLBACK:
+                            TEAMMATE_CALLBACK(name, "assistant", {"content": resp["content"]})
+                    idle_requested = True
+                    break
+
+                for tc in resp["tool_calls"]:
+                    tool_name = tc["function"]["name"]
+                    try:
+                        args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+                    if sig == last_tool_signature:
+                        similar_count += 1
+                        if similar_count >= STUCK_SIMILAR_THRESHOLD:
+                            print(f"\033[36m[队友 {name}] 重复操作，强制进入空闲\033[0m")
+                            idle_requested = True
+                            break
+                    else:
+                        similar_count = 0
+                        last_tool_signature = sig
+
+                    if tool_name == "plan_approval":
+                        if pending_plan_request_id is not None:
+                            output = f"错误: 已有等待批准的计划，请稍后"
+                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": output})
+                            continue
+                        output = self._execute_teammate_tool(name, tool_name, args)
+                        match = re.search(r"request_id=([a-f0-9]+)", output)
+                        if match:
+                            pending_plan_request_id = match.group(1)
+                    else:
+                        output = self._execute_teammate_tool(name, tool_name, args)
+
+                    print(f"\033[36m[队友 {name}] 🔧 {tool_name}\033[0m {str(output)[:100]}")
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(output)})
+                    
+                    if TEAMMATE_CALLBACK:
+                        TEAMMATE_CALLBACK(name, "tool", {
+                            "tool_name": tool_name,
+                            "arguments": args,
+                            "output": output
+                        })
+
+                    phase_tool_calls += 1
+                    total_tool_calls += 1
+
+                    if tool_name == "idle":
+                        idle_requested = True
+                    elif tool_name == "shutdown_response" and args.get("approve"):
+                        self._set_status(name, "shutdown")
+                        return
+
+                    if phase_tool_calls >= MAX_TOOL_CALLS_PER_PHASE:
+                        print(f"\033[36m[队友 {name}] 单阶段工具调用上限，强制进入空闲\033[0m")
+                        idle_requested = True
+                        break
+                    if total_tool_calls >= MAX_TOTAL_STEPS:
+                        print(f"\033[36m[队友 {name}] 总调用次数上限，自动关机\033[0m")
+                        self._set_status(name, "shutdown")
+                        return
+
+                if idle_requested:
+                    break
+
+            self._set_status(name, "idle")
+            resume = self._idle_poll(name, messages, role, team_name)
+            if not resume:
+                self._set_status(name, "shutdown")
+                return
+            self._set_status(name, "working")
+
+    def _idle_poll(self, name: str, messages: list, role: str, team_name: str) -> bool:
+        polls = IDLE_TIMEOUT // POLL_INTERVAL
+        for _ in range(polls):
+            time.sleep(POLL_INTERVAL)
+            inbox = BUS.read_inbox(name)
+            if inbox:
+                for msg in inbox:
+                    messages.append({"role": "user", "content": f"<inbox>\n{json.dumps(msg, indent=2, ensure_ascii=False)}\n</inbox>"})
+                BUS.clear_inbox(name)
+                return True
+            unclaimed = TASKS.find_pending_unclaimed()
+            if unclaimed:
+                task = unclaimed[0]
+                try:
+                    TASKS.update(task["id"], status="in_progress", owner=name)
+                except Exception as e:
+                    print(f"\033[36m[队友 {name}] 自动认领任务 #{task['id']} 失败: {e}\033[0m")
+                    continue
+                task_prompt = (
+                    f"<auto-claimed>任务 #{task['id']}: {task['subject']}\n"
+                    f"{task.get('description', '')}\n"
+                    f"建议: 使用 worktree_create name=task-{task['id']} task_id={task['id']} 创建工作树，然后在该工作树中完成任务。</auto-claimed>"
+                )                    
+                messages.append({"role": "user", "content": task_prompt})
+                messages.append({"role": "assistant", "content": f"已认领任务 #{task['id']}，现在开始工作。"})
+                BUS.send(name, "lead", f"我已认领任务 #{task['id']}: {task['subject']}", "message")
+                if TEAMMATE_CALLBACK:
+                    TEAMMATE_CALLBACK(name, "info", {
+                        "content": f"已自动认领任务 #{task['id']}: {task['subject']}"
+                    })
+                return True
+        print(f"\033[36m[队友 {name}] 空闲超时，自动关机\033[0m")
+        return False
+
+    def _execute_teammate_tool(self, sender: str, tool_name: str, args: dict) -> str:
+        if tool_name == "bash":
+            out, _ = run_bash(args["command"])
+            return out
+        if tool_name == "read_file":
+            out, _ = run_read(args["path"], args.get("limit"))
+            return out
+        if tool_name == "write_file":
+            out, _ = run_write(args["path"], args["content"])
+            return out
+        if tool_name == "edit_file":
+            out, _ = run_edit(args["path"], args["old_text"], args["new_text"])
+            return out
+        if tool_name == "send_message":
+            return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
+        if tool_name == "read_inbox":
+            msgs = BUS.read_inbox(sender)
+            BUS.clear_inbox(sender)
+            return json.dumps(msgs, indent=2, ensure_ascii=False)
+        if tool_name == "shutdown_response":
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in _shutdown_requests:
+                    _shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            BUS.send(sender, "lead", args.get("reason", ""),
+                     "shutdown_response", {"request_id": req_id, "approve": approve})
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            plan_text = args.get("plan", "")
+            req_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                _plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            BUS.send(sender, "lead", plan_text, "plan_approval_response",
+                     {"request_id": req_id, "plan": plan_text})
+            return f"Plan submitted (request_id={req_id})"
+        if tool_name == "idle":
+            return "进入空闲轮询模式"
+        # 任务/工作树工具
+        if tool_name == "task_create":
+            try:
+                return TASKS.create(args["subject"], args.get("description", ""))
+            except Exception as e:
+                return f"错误: 创建任务失败 - {str(e)}"
+        if tool_name == "task_list":
+            try:
+                return TASKS.list_all()
+            except Exception as e:
+                return f"错误: 列出任务失败 - {str(e)}"
+        if tool_name == "task_get":
+            try:
+                return TASKS.get(args["task_id"])
+            except Exception as e:
+                return f"错误: 获取任务失败 - {str(e)}"
+        if tool_name == "task_update":
+            try:
+                return TASKS.update(args["task_id"], args.get("status"), args.get("owner"))
+            except Exception as e:
+                return f"错误: 更新任务失败 - {str(e)}"
+        if tool_name == "task_bind_worktree":
+            try:
+                return TASKS.bind_worktree(args["task_id"], args["worktree"], args.get("owner", ""))
+            except Exception as e:
+                return f"错误: 绑定工作树失败 - {str(e)}"
+        if tool_name == "worktree_create":
+            try:
+                return WORKTREES.create(args["name"], args.get("task_id"), args.get("base_ref", "HEAD"))
+            except Exception as e:
+                return f"错误: 创建工作树失败 - {str(e)}"
+        if tool_name == "worktree_list":
+            try:
+                return WORKTREES.list_all()
+            except Exception as e:
+                return f"错误: 列出工作树失败 - {str(e)}"
+        if tool_name == "worktree_status":
+            try:
+                return WORKTREES.status(args["name"])
+            except Exception as e:
+                return f"错误: 获取工作树状态失败 - {str(e)}"
+        if tool_name == "worktree_run":
+            try:
+                return WORKTREES.run(args["name"], args["command"])
+            except Exception as e:
+                return f"错误: 在工作树中运行命令失败 - {str(e)}"
+        if tool_name == "worktree_keep":
+            try:
+                return WORKTREES.keep(args["name"])
+            except Exception as e:
+                return f"错误: 保留工作树失败 - {str(e)}"
+        if tool_name == "worktree_remove":
+            try:
+                return WORKTREES.remove(args["name"], args.get("force", False), args.get("complete_task", False))
+            except Exception as e:
+                return f"错误: 删除工作树失败 - {str(e)}"
+        if tool_name == "worktree_events":
+            try:
+                return EVENTS.list_recent(args.get("limit", 20))
+            except Exception as e:
+                return f"错误: 获取事件失败 - {str(e)}"
+        return f"未知工具: {tool_name}"
+
+    def _set_status(self, name: str, status: str):
+        member = self._find_member(name)
+        if member:
+            member["status"] = status
+            self._save_config()
+
+    def list_all(self) -> str:
+        if not self.config["members"]:
+            return "暂无队友"
+        lines = [f"团队: {self.config['team_name']}"]
+        for m in self.config["members"]:
+            lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
+        return "\n".join(lines)
+
+    def member_names(self) -> List[str]:
+        return [m["name"] for m in self.config["members"]]
+
+    def has_working_members(self) -> bool:
+        for m in self.config["members"]:
+            if m["status"] == "working":
+                return True
+        return False
+
+# 创建全局队友管理器实例
+TEAM = TeammateManager(TEAM_DIR)
+
 # ========== Tool Registry (可插拔工具核心) ==========
 class ToolRegistry:
     """管理所有工具：注册、启用/禁用、获取工具定义和处理器"""
@@ -917,23 +1358,21 @@ class ToolRegistry:
             ]
 
     def add_custom_tool(self, name: str, description: str, parameters: dict, code: str,
-                        enabled: bool = True) -> bool:
-        """添加自定义工具，动态创建 handler"""
-        # 验证代码安全性
-        if not self._validate_custom_code(code):
-            return False
-        # 创建 handler
+                    enabled: bool = True) -> Tuple[bool, str]:
+        """添加自定义工具，动态创建 handler。返回 (success, error_message)"""
+        valid, err_msg = self._validate_custom_code(code)
+        if not valid:
+            return False, err_msg
         try:
             handler = self._make_handler_from_code(name, code)
         except Exception as e:
-            print(f"创建自定义工具 handler 失败: {e}")
-            return False
-        # 注册
-        self.register(name, description, parameters, handler,
-                      enabled=enabled, builtin=False, editable=True)
-        # 持久化
+            return False, f"创建 handler 失败: {e}"
+        with self._lock:
+            self.register(name, description, parameters, handler,
+                        enabled=enabled, builtin=False, editable=True)
+            self._tools[name]["code"] = code
         self._save_custom_tool(name, description, parameters, code, enabled)
-        return True
+        return True, ""
 
     def update_custom_tool(self, name: str, description: str = None, parameters: dict = None,
                            code: str = None, enabled: bool = None) -> bool:
@@ -1030,39 +1469,39 @@ class ToolRegistry:
         try:
             ast.parse(code)
         except SyntaxError as e:
-            print(f"自定义工具语法错误: {e}")
-            return False
+            error_msg = f"语法错误: {e}"
+            return False, error_msg
         # 危险关键字检查
         dangerous_keywords = [
-            "os.system", "subprocess", "eval", "exec", "__import__", "open", "file",
+            "subprocess", "eval", "exec", "__import__", "open", "file",
             "globals", "locals", "__builtins__", "compile", "execfile", "input", "raw_input"
         ]
         # 允许使用安全的 open? 不允许文件写入可能带来风险，但自定义工具可能确实需要读写，这里简单拒绝包含这些的代码
         # 更好的方式是使用受限环境，但为了简单，我们只做基本警告，用户自行负责
         # 安全策略：只允许纯计算和标准库的特定模块（json, re, math, datetime, random, itertools, collections）
         # 检查是否 import 了不允许的模块
-        allowed_imports = {"json", "re", "math", "datetime", "random", "itertools", "collections", "typing"}
-        try:
-            tree = ast.parse(code)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        mod = alias.name.split('.')[0]
-                        if mod not in allowed_imports:
-                            print(f"禁止导入模块: {mod}")
-                            return False
-                elif isinstance(node, ast.ImportFrom):
-                    mod = node.module.split('.')[0] if node.module else ""
-                    if mod not in allowed_imports:
-                        print(f"禁止导入模块: {mod}")
-                        return False
-        except Exception:
-            return False
+        # allowed_imports = {"json", "re", "math", "datetime", "random", "itertools", "collections", "typing"}
+        # try:
+        #     tree = ast.parse(code)
+        #     for node in ast.walk(tree):
+        #         if isinstance(node, ast.Import):
+        #             for alias in node.names:
+        #                 mod = alias.name.split('.')[0]
+        #                 if mod not in allowed_imports:
+        #                     print(f"禁止导入模块: {mod}")
+        #                     return False
+        #         elif isinstance(node, ast.ImportFrom):
+        #             mod = node.module.split('.')[0] if node.module else ""
+        #             if mod not in allowed_imports:
+        #                 print(f"禁止导入模块: {mod}")
+        #                 return False
+        # except Exception:
+        #     return False
         # 危险函数调用检查
-        for kw in dangerous_keywords:
-            if kw in code:
-                print(f"自定义工具包含危险关键字: {kw}")
-                return False
+        # for kw in dangerous_keywords:
+        #     if kw in code:
+        #         print(f"自定义工具包含危险关键字: {kw}")
+        #         return False
         return True
 
     def _make_handler_from_code(self, name: str, code: str) -> Callable:
@@ -1357,7 +1796,10 @@ def run_read_inbox() -> Tuple[str, Optional[str]]:
     return json.dumps(msgs, indent=2, ensure_ascii=False), None
 
 def run_broadcast(content: str) -> Tuple[str, Optional[str]]:
-    return BUS.send("lead", "broadcast", content, "broadcast"), None
+    """广播消息给所有队友"""
+    for name in TEAM.member_names():
+        BUS.send("lead", name, content, "broadcast")
+    return f"已广播消息给 {len(TEAM.member_names())} 个队友", None
 
 def handle_shutdown_request(teammate: str) -> Tuple[str, Optional[str]]:
     req_id = str(uuid.uuid4())[:8]
@@ -1654,9 +2096,24 @@ def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Op
     STUCK_THRESHOLD = 2
     call_signatures = []
     consecutive_identical = 0
+    wait_until = 0
 
     while iteration < max_iterations:
         iteration += 1
+
+         # ----- 等待队友回复阶段 -----
+        if wait_until > time.time():
+            inbox_msgs = BUS.read_inbox("lead")
+            if inbox_msgs:
+                messages.append({"role": "user", "content": f"<inbox>\n{json.dumps(inbox_msgs, indent=2, ensure_ascii=False)}\n</inbox>"})
+                BUS.clear_inbox("lead")
+                wait_until = 0
+            else:
+                time.sleep(1)
+                continue
+        else:
+            wait_until = 0
+        # -------------
 
         micro_compact(messages)
         if estimate_tokens(messages) > THRESHOLD:
@@ -1804,6 +2261,11 @@ def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Op
                 used_todo = True
             elif tool_name == "compact":
                 manual_compact = True
+
+            if tool_name == "send_message" and args.get("to") in TEAM.member_names():
+                wait_until = time.time() + 120
+            elif tool_name == "spawn_teammate":
+                wait_until = time.time() + 10
 
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 

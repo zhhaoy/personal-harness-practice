@@ -11,8 +11,13 @@ import threading
 import queue
 import json
 import traceback
+import asyncio
+import ast
 from datetime import datetime
 from nicegui import ui, app
+
+from dotenv import load_dotenv
+load_dotenv(override=True)
 
 # 设置 WebSocket 超时环境变量
 os.environ["WEBSOCKET_PING_INTERVAL"] = "20"
@@ -210,11 +215,22 @@ def delete_custom_tool(name: str):
     else:
         ui.notify(f"删除工具 {name} 失败", type="negative")
 
-def create_custom_tool_from_requirement(requirement: str):
-    """根据自然语言需求，调用 LLM 生成自定义工具代码"""
-    from agent_loop import MultiModelClient
-    llm = MultiModelClient()
-    prompt = f"""你是一个工具生成器。根据用户的需求，生成一个完整的 Python 函数，函数名必须为 execute，接收一个字典参数 args，返回字符串。
+async def create_custom_tool_from_requirement(requirement: str):
+    """根据自然语言需求，调用 LLM 生成自定义工具代码（异步非阻塞）"""
+    if not requirement or not requirement.strip():
+        ui.notify("请输入工具需求", type="warning")
+        return
+
+    ui.notify("正在请求生成工具，请稍等...", type="info")
+
+    try:
+        from agent_loop import MultiModelClient
+        llm = await asyncio.to_thread(MultiModelClient)
+    except Exception as e:
+        ui.notify(f"初始化 LLM 失败: {e}", type="negative")
+        return
+
+    prompt = f"""你是一个工具生成器。根据用户需求，生成一个完整的 Python 函数，函数名必须为 execute，接收一个字典参数 args，返回字符串。
 用户需求: {requirement}
 
 要求：
@@ -222,51 +238,92 @@ def create_custom_tool_from_requirement(requirement: str):
 - 不要包含危险操作（如文件删除、系统命令执行等）
 - 可以导入标准库模块：json, re, math, datetime, random, itertools, collections
 - 代码必须安全、可执行
-- 返回的结果应该是字符串，不要输出额外的解释。
+- **只输出 Python 代码，不要输出任何解释或额外文字。代码需要用 ```python 开头和 ``` 结尾。**
+- 特别注意：字符串中如果有引号必须正确转义，不能出现未闭合的字符串。
 
-现在只输出代码，不要包含其他文字。代码应该以 ```python 开头或直接输出代码。"""
+请严格遵守：只输出代码。"""
 
     try:
-        resp = llm._chat_no_stream([{"role": "user", "content": prompt}], [])
+        resp = await asyncio.to_thread(llm._chat_no_stream, [{"role": "user", "content": prompt}], [])
         content = resp.get("content", "")
-        # 提取代码块
-        code = content
-        if "```python" in content:
-            code = content.split("```python")[1].split("```")[0].strip()
-        elif "```" in content:
-            code = content.split("```")[1].split("```")[0].strip()
-        # 验证代码
-        # 简单检查是否包含 execute 函数
-        if "def execute" not in code:
-            ui.notify("生成的代码缺少 execute 函数，请重新尝试", type="warning")
-            return None
-        # 弹出对话框让用户确认/编辑
+        if not content:
+            ui.notify("LLM 未返回内容", type="warning")
+            return
+
+        # 强化代码提取
+        import re
+        code = None
+        match = re.search(r"```python\s*\n(.*?)\n```", content, re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+        else:
+            match = re.search(r"```\s*\n(.*?)\n```", content, re.DOTALL)
+            if match:
+                code = match.group(1).strip()
+            else:
+                if "def execute" in content:
+                    code = content.strip()
+                else:
+                    print(f"[DIY工具] LLM返回内容（前500字符）:\n{content[:500]}")
+                    ui.notify("生成的代码不包含 execute 函数，请重试", type="negative")
+                    return
+
+        if not code or "def execute" not in code:
+            ui.notify("无法从 LLM 响应中提取 execute 函数", type="negative")
+            return
+
+        # 预验证代码语法
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            # 提供具体的语法错误信息
+            error_msg = f"生成的代码有语法错误：{e}. 请手动修正或重新生成。"
+            ui.notify(error_msg, type="warning")
+            # 仍然允许用户手动编辑（保留生成的代码）
+            code = code  # 保留原始代码，让用户手动修复
+
+        # 打开编辑对话框
         with ui.dialog() as dialog, ui.card():
             ui.label("生成的工具代码，请确认或编辑后保存").classes("text-lg font-bold")
             code_input = ui.textarea(value=code, placeholder="Python 代码...").classes("w-full h-80 font-mono")
             name_input = ui.input(label="工具名称", placeholder="my_tool").classes("w-full")
+            
             def do_save():
                 tool_name = name_input.value.strip()
                 if not tool_name:
                     ui.notify("请输入工具名称", type="warning")
                     return
-                # 保存工具
-                success = registry.add_custom_tool(tool_name, f"自定义工具: {tool_name}",
-                                                   {"type": "object", "properties": {}, "additionalProperties": True},
-                                                   code_input.value, enabled=True)
+                final_code = code_input.value
+                # 再次验证
+                try:
+                    ast.parse(final_code)
+                except SyntaxError as e:
+                    ui.notify(f"代码仍有语法错误：{e}，请修正", type="negative")
+                    return
+                from agent_loop import registry
+                success, err = registry.add_custom_tool(
+                    tool_name,
+                    f"自定义工具: {tool_name}",
+                    {"type": "object", "properties": {}, "additionalProperties": True},
+                    final_code,
+                    enabled=True
+                )
                 if success:
                     ui.notify(f"工具 {tool_name} 已创建", type="positive")
                     refresh_tool_diy_panel()
                     dialog.close()
                 else:
-                    ui.notify("工具创建失败，请检查代码安全性", type="negative")
+                    ui.notify(f"工具创建失败：{err}", type="negative")
+            
             ui.button("保存", on_click=do_save).props("color=primary")
             ui.button("取消", on_click=dialog.close).props("flat")
         dialog.open()
-        return code
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         ui.notify(f"生成失败: {str(e)}", type="negative")
-        return None
+
 
 # ---------- 回调函数 ----------
 def tool_callback(tool_name: str, args: dict, output: str):
@@ -467,8 +524,10 @@ def tool_diy_panel():
                 name = tool["name"]
                 enabled = tool["enabled"]
                 with ui.card().tight().classes("p-2").props("flat bordered"):
-                    ui.label(name).classes("text-sm font-mono")
-                    ui.switch(value=enabled, on_change=lambda e, n=name: toggle_tool_enable(n, e.value)).props("dense")
+                    # 修改点：移除 label 参数，在按钮后加文字
+                    row = ui.row().classes("items-center")
+                    sw = ui.switch(value=enabled, on_change=lambda e, n=name: toggle_tool_enable(n, e.value)).props("dense")
+                    ui.label(name).classes("text-sm font-mono ml-2")
         ui.separator()
         # 可编辑的自定义工具部分
         ui.label("自定义工具 (可编辑代码)").classes("text-md font-semibold mt-2")
@@ -482,16 +541,16 @@ def tool_diy_panel():
                         # 获取代码
                         code = get_custom_tool_code(name)
                         code_edit = ui.textarea(value=code, label="Python代码", placeholder="def execute(args: dict) -> str: ...").classes("w-full h-64 font-mono")
-                        # 开关
-                        ui.switch(value=enabled, label="启用", on_change=lambda e, n=name: toggle_tool_enable(n, e.value))
+                        # 修改点：开关布局
+                        row = ui.row().classes("items-center")
+                        sw = ui.switch(value=enabled, on_change=lambda e, n=name: toggle_tool_enable(n, e.value)).props("dense")
+                        ui.label("启用").classes("ml-2")
                         # 保存按钮
                         def save_tool(n=name, code_widget=code_edit):
                             new_code = code_widget.value
-                            # 简单验证
                             if "def execute" not in new_code:
                                 ui.notify("代码必须包含 execute 函数", type="warning")
                                 return
-                            # 更新工具
                             update_custom_tool(n, new_code, description=f"自定义工具: {n}", enabled=enabled)
                         ui.button("保存", on_click=save_tool).props("color=primary")
                         # 删除按钮
@@ -500,7 +559,6 @@ def tool_diy_panel():
                         ui.button("删除", on_click=delete_tool).props("color=negative")
         else:
             ui.label("暂无自定义工具，点击下方按钮创建").classes("text-gray-400")
-
         # 创建新工具区域
         ui.label("创建自定义工具").classes("text-md font-semibold mt-2")
         with ui.row().classes("gap-2 items-center"):
