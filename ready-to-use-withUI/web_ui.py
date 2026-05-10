@@ -61,7 +61,7 @@ def load_history():
     else:
         messages = [{
             "role": "assistant",
-            "content": "👋 你好！我是 PDM Agent，基于 Git Worktree 实现任务隔离。\n\n你可以提出开发需求，我会自动创建任务、工作树并执行。"
+            "content": "👋 你好！我是 PDM Agent，一名会主动干活的智能体。"
         }]
         tool_calls_history = []
     ui_chat.refresh()
@@ -596,7 +596,7 @@ def create_ui():
 
     with ui.header().classes("bg-primary text-white p-4"):
         ui.label("PDM Agent").classes("text-xl font-bold")
-        ui.label("基于 Git Worktree 的任务隔离助手").classes("text-sm opacity-80")
+        ui.label("Personal Harness").classes("text-sm opacity-80")
         ui.space()
         # 工具DIY按钮
         ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white")

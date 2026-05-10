@@ -908,7 +908,7 @@ class TeammateManager:
     def _autonomous_loop(self, name: str, role: str, prompt: str, initial_inbox_history: List[Dict]):
         team_name = self.config["team_name"]
         sys_prompt = (
-            f"你是队友 '{name}'，角色: {role}，团队: {team_name}，工作目录: {WORKDIR}，操作系统: {OS_INFO}。！！需使用适配该操作系统的bash命令！！ \n"
+            f"你是队员 '{name}',角色: {role}，团队: '{team_name}', 你的 inbox 地址 '{name}.jsonl', 团队 lead 的 inbox 地址: 'lead.jsonl', 工作目录: {WORKDIR}，操作系统: {OS_INFO}。！！需使用适配该操作系统的bash命令！！ \n"
             f"你可以使用以下工具：\n"
             f"  - 基础文件: read_file, write_file, edit_file, bash\n"
             f"  - 任务管理: task_create, task_list, task_get, task_update, task_bind_worktree\n"
@@ -916,16 +916,17 @@ class TeammateManager:
             f"  - 通信工具: send_message, read_inbox, shutdown_response, plan_approval, idle\n"
             f"工作流程建议：\n"
             f"1. 从任务板认领任务：使用 task_list 查看 pending 任务，然后 task_update 设置 owner 为自己，状态为 in_progress。\n"
-            f"2. 使用 send_message 给 Lead Agent 发送任务已被领取，正在执行 的信息。\n"
+            f"2. 使用 send_message 工具给团队 lead 发送'任务已被领取，正在执行'。\n"
             f"3. 为任务创建工作树：worktree_create name=<任务名> task_id=<任务ID> base_ref=HEAD\n"
             f"4. 在工作树中执行修改：worktree_run name=<任务名> command=\"...\"\n"
             f"5. 任务完成后，使用 worktree_remove name=<任务名> complete_task=true 自动清理并标记完成。\n"
-            f"6. 任务完成后，必须使用 send_message 给 Lead Agent 发送任务已完成的信息。 \n"
-            f"7. 当没有更多工作时，调用 idle 工具进入空闲状态。空闲时会自动轮询收件箱和任务板。\n"
+            f"6. 使用 send_message 工具给团队 lead 发送 '任务已完成' 的信息。 \n"            
+            f"7. 使用 read_inbox 工具查看 lead 或 其它队员发送的信息，并及时回复，如果问已完成任务信息，只需回复任务执行情况，无需重复执行任务。\n"
+            f"8. 当没有更多工作时，调用 idle 工具进入空闲状态。空闲时会自动轮询收件箱和任务板。\n"
             f"当收到 shutdown_request 时，请调用 shutdown_response 工具响应（approve 表示同意关机）。\n"
             f"对于重大更改，请先使用 plan_approval 工具提交计划给 lead，等待批准。\n"
             f"每个工作阶段最多调用 {MAX_TOOL_CALLS_PER_PHASE} 次工具，超过将强制进入 idle 。"
-            f"检查是否已经使用 send_message 给 Lead Agent 发送任务已完成的信息！"
+            f"最后，检查是否已经使用 send_message 工具给团队 lead 发送任务已完成的信息！"
         )
         teammate_tools_def = [
             {"type": "function", "function": {"name": "bash", "description": "执行Shell命令",
@@ -1911,33 +1912,36 @@ def get_dynamic_system_prompt() -> str:
     tools_list = registry.list_tools()
     enabled_tools = [t["name"] for t in tools_list if t["enabled"]]
     tools_desc = ", ".join(enabled_tools) if enabled_tools else "无"
-    return f"""你是一个智能助手（团队领导），当前工作目录: {WORKDIR}，操作系统: {OS_INFO}。
+    return f"""你是一个智能助手（团队领导，名为 lead ），当前工作目录: {WORKDIR}，操作系统: {OS_INFO}。
 Git 仓库根目录: {REPO_ROOT} (如果为空则不支持 worktree)。创建分支时，如分支已存在，则复用。
 
 当前启用的工具: {tools_desc}
 
 可用工具分类（根据 enable 状态，部分可能被禁用）：
 1. 基础文件操作：read_file, write_file, edit_file, bash
-2. 内部待办：todo
-3. 任务面板 + 隔离工作树：task_create, task_list, task_get, task_update, task_bind_worktree, worktree_create, worktree_list, worktree_status, worktree_run, worktree_keep, worktree_remove, worktree_events
-4. 队友管理：spawn_teammate, activate_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, plan_approval
-5. 后台命令：background_run, check_background
-6. 其他：load_skill, compact, task
+2. 技能加载：load_skill
+3. 内部待办清单：todo
+4. 内部任务：task
+5. 发布任务给队员，采用任务面板 + 隔离工作树方式：task_create, task_list, task_get, task_update, task_bind_worktree, worktree_create, worktree_list, worktree_status, worktree_run, worktree_keep, worktree_remove, worktree_events
+6. 队员管理：spawn_teammate, activate_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, plan_approval
+7. 上下文压缩：compact
+8. 后台命令：background_run, check_background
+9. 用户自定义工具
 
 **任务隔离工作流**：
-- 当你需要处理一个复杂或可能与其他工作冲突的任务时，先创建任务：task_create subject="描述" description="详细说明"
-- 为该任务创建一个独立的工作树：worktree_create name=短名称 task_id=<任务ID>
+- 当你需要处理一个可能与其他工作冲突的任务时，先为该任务创建一个独立的工作树：worktree_create name=短名称 task_id=<任务ID>
 - 在工作树内执行命令、修改文件：worktree_run name=短名称 command="..."
 - 任务完成后，清理工作树并自动将任务标记为完成：worktree_remove name=短名称 complete_task=true
 - 如果需要保留工作树以供后续使用，使用 worktree_keep
 
-队友会自动认领 pending 任务（无 owner）并进入各自的工作树执行，互不干扰。
-分配任务之前先检查队友状态，如果是 shutdown，需要先使用 activate_teammate 激活。
+**任务发布工作流**：
+- 当你需要发布任务给其它队员，先检查队友状态，如果是 shutdown，需要先使用 activate_teammate 激活
+- 然后创建任务：task_create subject="描述" description="详细说明"
+- 等待队员自动认领 pending 任务（无 owner），队员会进入各自的工作树执行，互不干扰
 
 原则：
 - 对于需要并行安全执行的任务，务必使用 task+worktree 模式。
-- 分配任务给队友时，可以先创建任务，队友空闲时会自动认领。
-- 避免无限等待队友，可以主动发送消息询问。
+- 分配任务给队友时，可以先确认队员存在且激活，然后创建任务，队友空闲时会自动认领。
 - 给出最终答案前，确保所有 todo 都已标记完成。
 """
 
@@ -2060,7 +2064,7 @@ def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Op
     # 预分析（保持不变）
     need_analysis = False
     prompt_lower = initial_prompt.lower()
-    complex_keywords = ["网站", "系统", "完整", "实现", "所有", "开发", "部署", "功能", "数据库", "前端", "后端", "api", "接口", "模型", "页面", "登录", "注册", "上传", "搜索", "推荐", "评分", "小红书", "风景"]
+    # complex_keywords = ["网站", "系统", "完整", "实现", "所有", "开发", "部署", "功能", "数据库", "前端", "后端", "api", "接口", "模型", "页面", "登录", "注册", "上传", "搜索", "推荐", "评分", "小红书", "风景"]
     if len(initial_prompt) > 200:
         need_analysis = True
     elif any(keyword in prompt_lower for keyword in ["计划", "任务分解", "分步骤", "逐步", "一系列", "网站", "系统", "完整"]):
@@ -2069,7 +2073,7 @@ def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Op
     if need_analysis:
         print("\033[90m[预分析...]\033[0m")
         analysis_messages = [
-            {"role": "system", "content": "你是一个任务分析器。分析用户请求，如果完成任务需要超过2个步骤，请输出一个 todo 列表（JSON数组，每个元素含 id, text, status='pending'）；否则只输出 'SIMPLE'。"},
+            {"role": "system", "content": "你是一个任务分析器。分析用户请求，如果完成任务需要超过 3 个步骤，请输出一个 todo 列表（JSON数组，每个元素含 id, text, status='pending'）；否则只输出 'SIMPLE'。"},
             {"role": "user", "content": initial_prompt}
         ]
         analysis_resp = llm._chat_no_stream(analysis_messages, [])
