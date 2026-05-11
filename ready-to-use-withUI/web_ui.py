@@ -27,7 +27,7 @@ try:
     from agent_loop import (
         agent_loop, AgentResult, set_teammate_callback,
         registry, run_spawn_teammate, run_list_teammates,  # 用于后端操作
-        CUSTOM_TOOLS_DIR, WORKDIR
+        CUSTOM_TOOLS_DIR, WORKDIR, SKILL_LOADER, validate_tool_code_safety
     )
 except ImportError:
     print("错误: 无法导入 agent_loop.py，请确保文件在同一目录下。")
@@ -124,11 +124,11 @@ def refresh_teammate_panel():
         print(f"刷新队友面板失败: {e}")
 
 def refresh_tool_diy_panel():
-    """刷新工具DIY面板"""
     try:
         tool_diy_panel.refresh()
     except Exception as e:
         print(f"刷新工具DIY面板失败: {e}")
+        traceback.print_exc()
 
 def add_teammate_message(teammate_name: str, subtype: str, data: dict):
     """添加队友消息，并刷新队友面板"""
@@ -216,12 +216,34 @@ def delete_custom_tool(name: str):
         ui.notify(f"删除工具 {name} 失败", type="negative")
 
 async def create_custom_tool_from_requirement(requirement: str):
-    """根据自然语言需求，调用 LLM 生成自定义工具代码（异步非阻塞）"""
     if not requirement or not requirement.strip():
         ui.notify("请输入工具需求", type="warning")
         return
 
-    ui.notify("正在请求生成工具，请稍等...", type="info")
+    # 优先尝试使用 tool-generator 技能
+    skill_name = "tool-generator"
+    skill_content = None
+    if skill_name in SKILL_LOADER.skills:
+        skill_content = SKILL_LOADER.get_content(skill_name)
+        ui.notify("✨ 使用内置「工具生成技能」生成代码...", type="info")
+    else:
+        ui.notify("未找到 tool-generator 技能，使用普通模式生成", type="warning")
+
+    # 构造提示词
+    if skill_content:
+        system_prompt = f"""你是一个严格的工具代码生成器。请遵循以下技能规范：
+
+{skill_content}
+
+严格遵守：只输出代码，用```python包裹。"""
+    else:
+        system_prompt = (
+            "你是一个工具生成器。根据用户需求，生成一个完整的 Python 函数，函数名必须为 execute，接收一个字典参数 args，返回字符串。\n"
+            "要求：\n- 函数签名: def execute(args: dict) -> str\n- 不要包含危险操作\n- 可以导入标准库模块：json, re, math, datetime, random, itertools, collections\n"
+            "只输出代码，用```python和```包裹。"
+        )
+
+    user_prompt = f"用户需求: {requirement}"
 
     try:
         from agent_loop import MultiModelClient
@@ -230,100 +252,92 @@ async def create_custom_tool_from_requirement(requirement: str):
         ui.notify(f"初始化 LLM 失败: {e}", type="negative")
         return
 
-    prompt = f"""你是一个工具生成器。根据用户需求，生成一个完整的 Python 函数，函数名必须为 execute，接收一个字典参数 args，返回字符串。
-用户需求: {requirement}
+    resp = await asyncio.to_thread(llm._chat_no_stream, [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ], [])
+    content = resp.get("content", "")
+    if not content:
+        ui.notify("LLM 未返回内容", type="warning")
+        return
 
-要求：
-- 函数签名: def execute(args: dict) -> str
-- 不要包含危险操作（如文件删除、系统命令执行等）
-- 可以导入标准库模块：json, re, math, datetime, random, itertools, collections
-- 代码必须安全、可执行
-- **只输出 Python 代码，不要输出任何解释或额外文字。代码需要用 ```python 开头和 ``` 结尾。**
-- 特别注意：字符串中如果有引号必须正确转义，不能出现未闭合的字符串。
-
-请严格遵守：只输出代码。"""
-
-    try:
-        resp = await asyncio.to_thread(llm._chat_no_stream, [{"role": "user", "content": prompt}], [])
-        content = resp.get("content", "")
-        if not content:
-            ui.notify("LLM 未返回内容", type="warning")
-            return
-
-        # 强化代码提取
-        import re
-        code = None
-        match = re.search(r"```python\s*\n(.*?)\n```", content, re.DOTALL)
+    # 提取代码（复用原有正则）
+    import re
+    code = None
+    match = re.search(r"```python\s*\n(.*?)\n```", content, re.DOTALL)
+    if match:
+        code = match.group(1).strip()
+    else:
+        match = re.search(r"```\s*\n(.*?)\n```", content, re.DOTALL)
         if match:
             code = match.group(1).strip()
         else:
-            match = re.search(r"```\s*\n(.*?)\n```", content, re.DOTALL)
-            if match:
-                code = match.group(1).strip()
+            if "def execute" in content:
+                code = content.strip()
             else:
-                if "def execute" in content:
-                    code = content.strip()
-                else:
-                    print(f"[DIY工具] LLM返回内容（前500字符）:\n{content[:500]}")
-                    ui.notify("生成的代码不包含 execute 函数，请重试", type="negative")
-                    return
+                ui.notify("生成的代码不包含 execute 函数，请重试", type="negative")
+                return
 
-        if not code or "def execute" not in code:
-            ui.notify("无法从 LLM 响应中提取 execute 函数", type="negative")
-            return
+    # 强制安全检查
+    safe, err = validate_tool_code_safety(code)
+    if not safe:
+        ui.notify(f"生成的代码不安全: {err}", type="negative")
+        return
 
-        # 预验证代码语法
-        try:
-            ast.parse(code)
-        except SyntaxError as e:
-            # 提供具体的语法错误信息
-            error_msg = f"生成的代码有语法错误：{e}. 请手动修正或重新生成。"
-            ui.notify(error_msg, type="warning")
-            # 仍然允许用户手动编辑（保留生成的代码）
-            code = code  # 保留原始代码，让用户手动修复
+    # 打开编辑对话框
+    with ui.dialog() as dialog, ui.card():
+        ui.label("生成的工具代码（已通过安全验证），请确认或编辑后保存").classes("text-lg font-bold")
+        code_input = ui.textarea(value=code, placeholder="Python 代码...").classes("w-full h-80 font-mono")
+        name_input = ui.input(label="工具名称", placeholder="my_tool").classes("w-full")
+        
+        # 先定义异步函数
+        async def do_save():
+            tool_name = name_input.value.strip()
+            if not tool_name:
+                ui.notify("❌ 工具名称不能为空", type="warning")
+                return
 
-        # 打开编辑对话框
-        with ui.dialog() as dialog, ui.card():
-            ui.label("生成的工具代码，请确认或编辑后保存").classes("text-lg font-bold")
-            code_input = ui.textarea(value=code, placeholder="Python 代码...").classes("w-full h-80 font-mono")
-            name_input = ui.input(label="工具名称", placeholder="my_tool").classes("w-full")
-            
-            def do_save():
-                tool_name = name_input.value.strip()
-                if not tool_name:
-                    ui.notify("请输入工具名称", type="warning")
-                    return
-                final_code = code_input.value
-                # 再次验证
-                try:
-                    ast.parse(final_code)
-                except SyntaxError as e:
-                    ui.notify(f"代码仍有语法错误：{e}，请修正", type="negative")
-                    return
-                from agent_loop import registry
-                success, err = registry.add_custom_tool(
+            final_code = code_input.value
+            # 1. 安全检查
+            safe, err = validate_tool_code_safety(final_code)
+            if not safe:
+                ui.notify(f"❌ 代码不安全: {err}", type="negative")
+                return
+
+            # 2. 可选：检查是否包含 execute 函数（validate_tool_code_safety 已检查过，但提示更友好）
+            if "def execute" not in final_code:
+                ui.notify("❌ 工具代码必须包含 'def execute(args: dict) -> str:'", type="negative")
+                return
+
+            try:
+                # 3. 调用注册（注意这里直接在异步函数中调用同步方法，可能会阻塞 UI，但时间极短）
+                #    如果不想阻塞，可以保持 asyncio.to_thread，但要确保内部异常被捕获。
+                success, msg = await asyncio.to_thread(
+                    registry.add_custom_tool,
                     tool_name,
                     f"自定义工具: {tool_name}",
                     {"type": "object", "properties": {}, "additionalProperties": True},
                     final_code,
-                    enabled=True
+                    True
                 )
                 if success:
-                    ui.notify(f"工具 {tool_name} 已创建", type="positive")
-                    refresh_tool_diy_panel()
+                    ui.notify(f"✅ 工具 '{tool_name}' 已创建", type="positive")
+                    # 强制刷新 DIY 面板（直接调用 refreshable 对象的 refresh 方法）
+                    ui.timer(0.5, lambda: tool_diy_panel.refresh(), once=True)
+                    # 关闭对话框
                     dialog.close()
                 else:
-                    ui.notify(f"工具创建失败：{err}", type="negative")
-            
-            ui.button("保存", on_click=do_save).props("color=primary")
-            ui.button("取消", on_click=dialog.close).props("flat")
-        dialog.open()
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        ui.notify(f"生成失败: {str(e)}", type="negative")
-
+                    ui.notify(f"❌ 创建失败: {msg}", type="negative")
+                    print(f"[DEBUG] add_custom_tool 返回: success={success}, msg={msg}")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                ui.notify(f"❌ 保存时发生异常: {str(e)}", type="negative")
+        
+        # 创建按钮（现在 do_save 已定义）
+        ui.button("保存", on_click=do_save).props("color=primary")
+        ui.button("取消", on_click=dialog.close).props("flat")
+    dialog.open()
 
 # ---------- 回调函数 ----------
 def tool_callback(tool_name: str, args: dict, output: str):

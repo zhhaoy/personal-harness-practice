@@ -166,6 +166,36 @@ def detect_repo_root(cwd: Path) -> Path | None:
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
+FORBIDDEN_FUNCS = {"open", "eval", "exec", "__import__", "compile", "globals",
+            "locals", "vars", "dir", "help", "input", "raw_input"}
+FORBIDDEN_ATTR = {"system", "popen", "remove", "unlink", "rmdir", "rename",
+                "chdir", "getenv", "putenv", "environ", "run", "Popen"}
+
+def validate_tool_code_safety(code: str) -> Tuple[bool, str]:
+    """返回 (是否安全, 错误信息)"""
+    # 语法检查
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return False, f"语法错误: {e}"
+
+    # 遍历 AST
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        # 禁止调用危险函数
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in FORBIDDEN_FUNCS:
+                    return False, f"禁止调用函数: {node.func.id}"
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr in FORBIDDEN_ATTR:
+                    return False, f"禁止调用属性: {node.func.attr}"
+                # 检查是否是 os.subprocess 等危险对象的方法
+                if isinstance(node.func.value, ast.Name):
+                    if node.func.value.id in {"os", "subprocess", "shutil", "sys"}:
+                        return False, f"禁止通过 {node.func.value.id} 调用 {node.func.attr}"
+    return True, ""
+
 # ========== EventBus: 生命周期事件记录 ==========
 class EventBus:
     def __init__(self, event_log_path: Path):
@@ -1280,21 +1310,20 @@ class ToolRegistry:
     """管理所有工具：注册、启用/禁用、获取工具定义和处理器"""
     def __init__(self):
         self._tools: Dict[str, Dict] = {}   # name -> {description, parameters, handler, enabled, builtin, editable}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._load_custom_tools()
 
     def register(self, name: str, description: str, parameters: dict, handler: Callable,
-                 enabled: bool = True, builtin: bool = True, editable: bool = False):
-        """注册一个工具"""
-        with self._lock:
-            self._tools[name] = {
-                "description": description,
-                "parameters": parameters,
-                "handler": handler,
-                "enabled": enabled,
-                "builtin": builtin,
-                "editable": editable,
-            }
+             enabled: bool = True, builtin: bool = True, editable: bool = False):
+        # 注意：此方法应由已持有 self._lock 的调用者调用
+        self._tools[name] = {
+            "description": description,
+            "parameters": parameters,
+            "handler": handler,
+            "enabled": enabled,
+            "builtin": builtin,
+            "editable": editable,
+        }
 
     def enable(self, name: str) -> bool:
         with self._lock:
@@ -1361,7 +1390,6 @@ class ToolRegistry:
 
     def add_custom_tool(self, name: str, description: str, parameters: dict, code: str,
                     enabled: bool = True) -> Tuple[bool, str]:
-        """添加自定义工具，动态创建 handler。返回 (success, error_message)"""
         valid, err_msg = self._validate_custom_code(code)
         if not valid:
             return False, err_msg
@@ -1369,11 +1397,27 @@ class ToolRegistry:
             handler = self._make_handler_from_code(name, code)
         except Exception as e:
             return False, f"创建 handler 失败: {e}"
+        
+        # 准备保存的数据（在锁外）
+        tool_data = {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+            "code": code,
+            "enabled": enabled,
+        }
+        
+        # 先写入文件，确保能持久化再注册到内存（避免不一致）
+        try:
+            self._save_custom_tool(name, description, parameters, code, enabled)
+        except Exception as e:
+            return False, f"保存文件失败: {e}"
+        
+        # 注册到内存，只持有锁一小会儿
         with self._lock:
             self.register(name, description, parameters, handler,
                         enabled=enabled, builtin=False, editable=True)
             self._tools[name]["code"] = code
-        self._save_custom_tool(name, description, parameters, code, enabled)
         return True, ""
 
     def update_custom_tool(self, name: str, description: str = None, parameters: dict = None,
@@ -1426,7 +1470,8 @@ class ToolRegistry:
                 parameters = tool["parameters"]
                 code = tool["code"]
                 enabled = tool.get("enabled", True)
-                if self._validate_custom_code(code):
+                valid, _ = self._validate_custom_code(code)
+                if valid:
                     handler = self._make_handler_from_code(name, code)
                     self.register(name, description, parameters, handler,
                                   enabled=enabled, builtin=False, editable=True)
@@ -1439,10 +1484,13 @@ class ToolRegistry:
             print(f"加载自定义工具失败: {e}")
 
     def _save_custom_tool(self, name: str, description: str, parameters: dict, code: str, enabled: bool):
-        """保存单个自定义工具到文件"""
+        # 确保目录存在
+        CUSTOM_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        meta_path = CUSTOM_TOOLS_DIR / "custom_tools.json"
+        # 读取现有数据
         tools_data = []
-        if CUSTOM_TOOLS_META_PATH.exists():
-            with open(CUSTOM_TOOLS_META_PATH, "r", encoding="utf-8") as f:
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
                 tools_data = json.load(f)
         # 移除旧的同名条目
         tools_data = [t for t in tools_data if t.get("name") != name]
@@ -1453,7 +1501,7 @@ class ToolRegistry:
             "code": code,
             "enabled": enabled,
         })
-        with open(CUSTOM_TOOLS_META_PATH, "w", encoding="utf-8") as f:
+        with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(tools_data, f, indent=2, ensure_ascii=False)
 
     def _remove_custom_tool_file(self, name: str):
@@ -1464,47 +1512,15 @@ class ToolRegistry:
         tools_data = [t for t in tools_data if t.get("name") != name]
         with open(CUSTOM_TOOLS_META_PATH, "w", encoding="utf-8") as f:
             json.dump(tools_data, f, indent=2, ensure_ascii=False)
-
-    def _validate_custom_code(self, code: str) -> bool:
-        """验证自定义工具代码安全性：语法检查 + 危险关键字黑名单"""
-        # 语法检查
-        try:
-            ast.parse(code)
-        except SyntaxError as e:
-            error_msg = f"语法错误: {e}"
-            return False, error_msg
-        # 危险关键字检查
-        dangerous_keywords = [
-            "subprocess", "eval", "exec", "__import__", "open", "file",
-            "globals", "locals", "__builtins__", "compile", "execfile", "input", "raw_input"
-        ]
-        # 允许使用安全的 open? 不允许文件写入可能带来风险，但自定义工具可能确实需要读写，这里简单拒绝包含这些的代码
-        # 更好的方式是使用受限环境，但为了简单，我们只做基本警告，用户自行负责
-        # 安全策略：只允许纯计算和标准库的特定模块（json, re, math, datetime, random, itertools, collections）
-        # 检查是否 import 了不允许的模块
-        # allowed_imports = {"json", "re", "math", "datetime", "random", "itertools", "collections", "typing"}
-        # try:
-        #     tree = ast.parse(code)
-        #     for node in ast.walk(tree):
-        #         if isinstance(node, ast.Import):
-        #             for alias in node.names:
-        #                 mod = alias.name.split('.')[0]
-        #                 if mod not in allowed_imports:
-        #                     print(f"禁止导入模块: {mod}")
-        #                     return False
-        #         elif isinstance(node, ast.ImportFrom):
-        #             mod = node.module.split('.')[0] if node.module else ""
-        #             if mod not in allowed_imports:
-        #                 print(f"禁止导入模块: {mod}")
-        #                 return False
-        # except Exception:
-        #     return False
-        # 危险函数调用检查
-        # for kw in dangerous_keywords:
-        #     if kw in code:
-        #         print(f"自定义工具包含危险关键字: {kw}")
-        #         return False
-        return True
+        
+    def _validate_custom_code(self, code: str) -> Tuple[bool, str]:        
+        ok, msg = validate_tool_code_safety(code)
+        if not ok:
+            return False, msg
+        # 额外检查必须包含 execute 函数（已在其他地方检查，但这里也做）
+        if "def execute" not in code:
+            return False, "代码必须定义 execute(args: dict) -> str 函数"
+        return True, ""
 
     def _make_handler_from_code(self, name: str, code: str) -> Callable:
         """从代码字符串创建可调用的 handler 函数，要求代码中定义了一个名为 execute 的函数，接收一个字典参数，返回字符串"""
