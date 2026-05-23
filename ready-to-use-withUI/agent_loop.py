@@ -21,7 +21,7 @@ import inspect
 import traceback
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import importlib.util
 import ast
 
@@ -54,6 +54,17 @@ try:
 except ImportError:
     print("警告: 未安装 PyYAML，技能加载功能将不可用。请运行: pip install pyyaml")
     yaml = None
+
+try:
+    from meta_operation import (
+        run_meta_dispatch, run_meta_status, run_meta_handover,
+        run_meta_feedback, run_meta_improve, run_meta_list,
+        get_dispatcher, ParadigmType
+    )
+    META_OPERATION_AVAILABLE = True
+except ImportError:
+    print("警告: meta_operation 模块未找到，元操作工具将不可用")
+    META_OPERATION_AVAILABLE = False
 
 # ========== 配置常量 ==========
 DEFAULT_TIMEOUT = 120
@@ -863,8 +874,6 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 # ========== TeammateManager (队友线程，使用任务+工作树机制) ==========
-import uuid  # 确保已导入
-
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -1305,6 +1314,115 @@ class TeammateManager:
 # 创建全局队友管理器实例
 TEAM = TeammateManager(TEAM_DIR)
 
+@dataclass
+class WorkflowState:
+    session_id: str                # 唯一标识（可关联 task_id 或 conversation_id）
+    task_id: Optional[int]         # 可选绑定任务板 ID
+    phase: str                     # 当前阶段: ARCH, REQ, DESIGN, CONFIRM, EXEC, VERIFY, REFINE, DONE
+    artifacts: Dict[str, str]      # 各阶段产出: {"ARCH": "...", "REQ": "...", ...}
+    pending_plan: str              # 待固化的计划（DESIGN 产出）
+    error_count: int
+    created_at: float
+    updated_at: float
+
+class WorkflowManager:
+    """管理多个会话的工作流状态，持久化到 .workflows/ 目录"""
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir / ".workflows"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._states: Dict[str, WorkflowState] = {}
+        self._load_all()
+
+    def _load_all(self):
+        for f in self.base_dir.glob("*.json"):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                state = WorkflowState(**data)
+                self._states[state.session_id] = state
+            except Exception as e:
+                print(f"加载工作流状态失败 {f}: {e}")
+
+    def _save(self, state: WorkflowState):
+        path = self.base_dir / f"{state.session_id}.json"
+        path.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+
+    def get_or_create(self, session_id: str, task_id: Optional[int] = None) -> WorkflowState:
+        if session_id in self._states:
+            return self._states[session_id]
+        state = WorkflowState(
+            session_id=session_id,
+            task_id=task_id,
+            phase="ARCH",
+            artifacts={},
+            pending_plan="",
+            error_count=0,
+            created_at=time.time(),
+            updated_at=time.time(),
+        )
+        self._states[session_id] = state
+        self._save(state)
+        return state
+
+    def get(self, session_id: str) -> Optional[WorkflowState]:
+        return self._states.get(session_id)
+
+    def update(self, state: WorkflowState):
+        state.updated_at = time.time()
+        self._states[state.session_id] = state
+        self._save(state)
+
+    def delete(self, session_id: str):
+        if session_id in self._states:
+            del self._states[session_id]
+            (self.base_dir / f"{session_id}.json").unlink(missing_ok=True)
+
+    def transition(self, session_id: str, event: str, artifact: str = "") -> Tuple[str, str]:
+        """
+        执行状态转移，返回 (new_phase, instruction)
+        event: "confirm" (用户确认固化), "execute_done", "verify_pass", "verify_fail", "refine_done", "abort"
+        artifact: 当前阶段生成的产出文本
+        """
+        state = self.get_or_create(session_id)
+        old_phase = state.phase
+
+        # 保存当前阶段的产出
+        if artifact and old_phase in ("ARCH", "REQ", "DESIGN", "EXEC", "REFINE"):
+            state.artifacts[old_phase] = artifact
+
+        # 状态转移逻辑
+        if old_phase == "ARCH" and event == "confirm":
+            state.phase = "REQ"
+            instr = "请输出需求分析（验收标准、功能列表、模糊点），然后询问用户确认。"
+        elif old_phase == "REQ" and event == "confirm":
+            state.phase = "DESIGN"
+            instr = "请输出详细设计（可执行的步骤、接口、数据结构），完成后询问用户固化（回复'固化'）。"
+        elif old_phase == "DESIGN" and event == "confirm":
+            state.phase = "CONFIRM"
+            state.pending_plan = artifact
+            instr = "请等待用户输入'固化'以锁定计划，否则返回修改设计。"
+        elif old_phase == "CONFIRM" and event == "confirm":
+            state.phase = "EXEC"
+            instr = "计划已固化。请严格按照设计逐步执行，每完成一步调用 workflow_step 并传入 'execute_done' 事件。"
+        elif old_phase == "EXEC" and event == "execute_done":
+            state.phase = "VERIFY"
+            instr = "请验证执行结果是否符合需求验收标准，输出验证报告，然后调用 workflow_step 选择 'verify_pass' 或 'verify_fail'。"
+        elif old_phase == "VERIFY" and event == "verify_pass":
+            state.phase = "DONE"
+            instr = "验证通过，工作流完成。你可以输出最终答案。"
+        elif old_phase == "VERIFY" and event == "verify_fail":
+            state.phase = "REFINE"
+            instr = "验证失败，请修正问题，然后调用 workflow_step 传入 'refine_done'。"
+        elif old_phase == "REFINE" and event == "refine_done":
+            state.phase = "VERIFY"
+            instr = "修正完成，请重新验证。"
+        else:
+            raise ValueError(f"非法转移: {old_phase} + {event}")
+
+        self.update(state)
+        return state.phase, instr
+
+WORKFLOWS = WorkflowManager(REPO_ROOT)
+
 # ========== Tool Registry (可插拔工具核心) ==========
 class ToolRegistry:
     """管理所有工具：注册、启用/禁用、获取工具定义和处理器"""
@@ -1652,7 +1770,51 @@ def _make_base_tools():
     registry.register("worktree_events", "查看工作树生命周期事件",
         {"type": "object", "properties": {"limit": {"type": "integer"}}},
         lambda **kw: run_worktree_events(kw.get("limit", 20)), builtin=True, editable=False)
-
+    registry.register("workflow_start", "启动一个工程化工作流（架构→需求→设计→固化→执行→验证→修正），返回会话ID和第一步指令",
+        {"type": "object", "properties": {"session_id": {"type": "string", "description": "可选，不提供则自动生成"},"task_id": {"type": "integer", "description": "可选，绑定任务板ID"},}, "additionalProperties": False,},
+        lambda **kw: run_workflow_start(kw.get("session_id", ""), kw.get("task_id")), builtin=True, editable=False)
+    registry.register("workflow_step", "推进工作流：提交当前阶段产出和事件（如 confirm, execute_done, verify_pass, verify_fail, refine_done）", {"type": "object", "properties": {"session_id": {"type": "string"}, "event": {"type": "string", "enum": ["confirm", "execute_done", "verify_pass", "verify_fail", "refine_done", "abort"]}, "artifact": {"type": "string", "description": "当前阶段的产出文本（可选，但建议传入）"},}, "required": ["session_id", "event"], },
+        lambda **kw: run_workflow_step(kw["session_id"], kw["event"], kw.get("artifact", "")), builtin=True, editable=False)
+    registry.register("workflow_status", "查询工作流当前状态", {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"], },
+        lambda **kw: run_workflow_status(kw["session_id"]), builtin=True, editable=False)
+    
+    # 元操作工具组
+    if META_OPERATION_AVAILABLE:
+        registry.register("meta_dispatch", "分析用户query，识别行动范式，并调度到对应的元操作工具",
+            {"type": "object", "properties": {
+                "query": {"type": "string", "description": "用户的原始query"},
+                "context": {"type": "object", "description": "上下文信息（可选）"},
+                "force_paradigm": {"type": "string", "enum": ["CODE_DEV", "FEATURE_DESIGN", "ENGINEERING", "TEST_EVAL", "DOC_WRITING", "DATA_ANALYSIS", "GENERAL"]}
+            }, "required": ["query"]},
+            lambda **kw: run_meta_dispatch(kw["query"], kw.get("context"), kw.get("force_paradigm")), builtin=True, editable=False)
+        registry.register("meta_status", "查询当前元操作的执行状态、进度和产出物",
+            {"type": "object", "properties": {"session_id": {"type": "string", "description": "会话ID（可选，默认为当前会话）"}}},
+            lambda **kw: run_meta_status(kw.get("session_id")), builtin=True, editable=False)
+        registry.register("meta_handover", "将当前任务移交给其他元操作，保留上下文和进度",
+            {"type": "object", "properties": {
+                "target_paradigm": {"type": "string", "description": "目标范式"},
+                "reason": {"type": "string", "description": "移交原因"},
+                "carry_context": {"type": "boolean", "description": "是否携带当前上下文", "default": True}
+            }, "required": ["target_paradigm", "reason"]},
+            lambda **kw: run_meta_handover(kw["target_paradigm"], kw["reason"], kw.get("carry_context", True)), builtin=True, editable=False)
+        registry.register("meta_feedback", "用户对元操作执行结果的反馈，用于改进元操作",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string"},
+                "rating": {"type": "integer", "minimum": 1, "maximum": 5, "description": "满意度评分"},
+                "feedback_text": {"type": "string", "description": "具体反馈内容"},
+                "issue_type": {"type": "string", "enum": ["wrong_paradigm", "incomplete", "tool_misuse", "performance", "other"]}
+            }, "required": ["session_id", "rating"]},
+            lambda **kw: run_meta_feedback(kw["session_id"], kw["rating"], kw.get("feedback_text", ""), kw.get("issue_type")), builtin=True, editable=False)
+        registry.register("meta_improve", "根据用户反馈或问题，改进元操作工具的实现",
+            {"type": "object", "properties": {
+                "paradigm": {"type": "string", "description": "要改进的元操作范式"},
+                "improvement_request": {"type": "string", "description": "改进需求描述"},
+                "auto_validate": {"type": "boolean", "description": "是否自动验证改进结果", "default": True}
+            }, "required": ["paradigm", "improvement_request"]},
+            lambda **kw: run_meta_improve(kw["paradigm"], kw["improvement_request"], kw.get("auto_validate", True)), builtin=True, editable=False)
+        registry.register("meta_list", "列出所有可用的元操作",
+            {"type": "object", "properties": {}},
+            lambda **kw: run_meta_list(), builtin=True, editable=False)
 
 # 创建全局注册表实例
 registry = ToolRegistry()
@@ -1882,6 +2044,38 @@ def run_worktree_remove(name: str, force: bool = False, complete_task: bool = Fa
 def run_worktree_events(limit: int = 20) -> Tuple[str, Optional[str]]:
     return EVENTS.list_recent(limit), None
 
+def run_workflow_start(session_id: str = "", task_id: int = None) -> Tuple[str, Optional[str]]:
+    """启动一个新的工作流，返回当前阶段及指令"""
+    if not session_id:
+        session_id = str(uuid.uuid4())[:8]
+    state = WORKFLOWS.get_or_create(session_id, task_id)
+    instruction = {
+        "phase": state.phase,
+        "message": "请输出架构设计（整体结构、技术选型、约束），然后询问用户确认。"
+    }
+    return json.dumps({"session_id": session_id, "instruction": instruction}), None
+
+def run_workflow_step(session_id: str, event: str, artifact: str = "") -> Tuple[str, Optional[str]]:
+    """提交当前阶段的产出和事件，推进工作流"""
+    try:
+        new_phase, instruction = WORKFLOWS.transition(session_id, event, artifact)
+        return json.dumps({"phase": new_phase, "instruction": instruction}), None
+    except ValueError as e:
+        return "", f"工作流错误: {str(e)}"
+
+def run_workflow_status(session_id: str) -> Tuple[str, Optional[str]]:
+    """查询当前工作流状态"""
+    state = WORKFLOWS.get(session_id)
+    if not state:
+        return f"未找到工作流: {session_id}", None
+    info = {
+        "session_id": state.session_id,
+        "phase": state.phase,
+        "artifacts": list(state.artifacts.keys()),
+        "task_id": state.task_id,
+    }
+    return json.dumps(info, indent=2), None
+
 # 现在注册内置工具
 _make_base_tools()
 
@@ -1942,7 +2136,32 @@ Git 仓库根目录: {REPO_ROOT} (如果为空则不支持 worktree)。创建分
 6. 队员管理：spawn_teammate, activate_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, plan_approval
 7. 上下文压缩：compact
 8. 后台命令：background_run, check_background
-9. 用户自定义工具
+9. 工作流工具：workflow_start, workflow_step, workflow_status
+10. 元操作工具（推荐优先使用）：meta_dispatch, meta_status, meta_handover, meta_feedback, meta_improve, meta_list
+11. 用户自定义工具
+
+**【重要】元操作工具使用指南**：
+元操作是更高层次的工具抽象，将任务按范式分类并调度到对应的执行流程。推荐优先使用：
+
+- **meta_dispatch**: 分析用户query，自动识别范式（CODE_DEV/FEATURE_DESIGN/ENGINEERING/TEST_EVAL等），并调度到对应元操作
+- **meta_status**: 查询当前元操作执行状态
+- **meta_handover**: 将任务移交给其他元操作（如从开发移交到测试）
+- **meta_feedback**: 对元操作结果进行反馈
+- **meta_improve**: 根据反馈改进元操作
+- **meta_list**: 列出所有可用元操作
+
+**范式类型**：
+- CODE_DEV: 代码开发类（实现功能、修复bug、重构代码）
+- FEATURE_DESIGN: 功能设计类（系统设计、架构设计）
+- ENGINEERING: 工程实践类（CI/CD、部署、监控）
+- TEST_EVAL: 测试评估类（编写测试、覆盖率分析）
+- DOC_WRITING: 文档编写类（README、API文档）
+- DATA_ANALYSIS: 数据分析类（数据处理、可视化）
+- GENERAL: 通用问答类（简单问答）
+
+**推荐使用方式**：
+当用户提出任务时，优先调用 meta_dispatch 进行范式识别和自动调度，而不是直接调用原子工具。
+元操作会在内部协调使用 workflow、task 等工具，确保工具调用有章程、不混乱。
 
 **任务隔离工作流**：
 - 当你需要处理一个可能与其他工作冲突的任务时，先为该任务创建一个独立的工作树：worktree_create name=短名称 task_id=<任务ID>
@@ -1954,6 +2173,13 @@ Git 仓库根目录: {REPO_ROOT} (如果为空则不支持 worktree)。创建分
 - 当你需要发布任务给其它队员，先检查队友状态，如果是 shutdown，需要先使用 activate_teammate 激活
 - 然后创建任务：task_create subject="描述" description="详细说明"
 - 等待队员自动认领 pending 任务（无 owner），队员会进入各自的工作树执行，互不干扰
+
+**工程化工作流使用指南（用于复杂多步任务）**：
+- 当用户请求需要严格的分析-设计-实现-验证流程时，先调用 `workflow_start` 获取 session_id。
+- 然后严格按照返回的指令输出当前阶段内容（架构、需求、设计...），并调用 `workflow_step` 传入事件 "confirm"（用户确认后）或 "execute_done" 等。
+- 只有设计阶段获得用户明确“固化”后，才能进入执行。
+- 执行完成后调用 `workflow_step(event="execute_done")`，然后进入验证，根据结果决定下一步。
+- 工作流状态由系统自动维持，你只需每次调用 `workflow_step` 传递正确的产出和事件。
 
 原则：
 - 对于需要并行安全执行的任务，务必使用 task+worktree 模式。
