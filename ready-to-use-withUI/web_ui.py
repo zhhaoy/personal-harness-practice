@@ -42,6 +42,10 @@ STORAGE_KEY = "pdm_chat_history"
 CURRENT_ASSISTANT_MSG_INDEX = -1
 timer_handle = None
 
+# 防抖控制：避免频繁刷新
+_pending_refresh = {"chat": False, "tool": False, "teammate": False}
+_refresh_lock = threading.Lock()
+
 # ---------- 心跳线程 ----------
 heartbeat_stop = threading.Event()
 
@@ -49,6 +53,29 @@ def heartbeat_sender():
     while not heartbeat_stop.wait(15):
         if is_running:
             result_queue.put({"type": "heartbeat"})
+
+# ---------- 防抖刷新 ----------
+def schedule_refresh(refresh_type: str, delay: float = 0.1):
+    """调度延迟刷新，避免频繁刷新导致断连"""
+    with _refresh_lock:
+        if not _pending_refresh.get(refresh_type):
+            _pending_refresh[refresh_type] = True
+            ui.timer(delay, lambda: do_refresh(refresh_type), once=True)
+
+def do_refresh(refresh_type: str):
+    """执行实际刷新"""
+    with _refresh_lock:
+        _pending_refresh[refresh_type] = False
+    
+    try:
+        if refresh_type == "chat":
+            ui_chat.refresh()
+        elif refresh_type == "tool":
+            tool_panel.refresh()
+        elif refresh_type == "teammate":
+            teammate_panel.refresh()
+    except Exception as e:
+        print(f"刷新失败: {e}")
 
 # ---------- 会话持久化 ----------
 def load_history():
@@ -73,7 +100,7 @@ def save_history():
 def add_user_message(content: str):
     messages.append({"role": "user", "content": content, "timestamp": datetime.now().isoformat()})
     save_history()
-    ui_chat.refresh()
+    schedule_refresh("chat")
 
 def add_assistant_message(content: str, tool_calls: list = None):
     global CURRENT_ASSISTANT_MSG_INDEX
@@ -85,7 +112,7 @@ def add_assistant_message(content: str, tool_calls: list = None):
     })
     CURRENT_ASSISTANT_MSG_INDEX = len(messages) - 1
     save_history()
-    ui_chat.refresh()
+    schedule_refresh("chat")
 
 def update_last_assistant_content(fragment: str):
     global CURRENT_ASSISTANT_MSG_INDEX
@@ -99,7 +126,7 @@ def update_last_assistant_content(fragment: str):
         CURRENT_ASSISTANT_MSG_INDEX = len(messages) - 1
     messages[CURRENT_ASSISTANT_MSG_INDEX]["content"] += fragment
     save_history()
-    ui_chat.refresh()
+    schedule_refresh("chat")
 
 def add_tool_call_notification(tool_name: str, args: dict, output: str):
     """添加工具调用记录（用于 lead 的工具调用）"""
@@ -113,19 +140,19 @@ def add_tool_call_notification(tool_name: str, args: dict, output: str):
     messages.append(record)
     tool_calls_history.append(record)   # 同步到历史列表
     save_history()
-    ui_chat.refresh()
-    tool_panel.refresh()                # 刷新工具调用面板
+    schedule_refresh("chat", 0.15)  # 稍长延迟，避免频繁刷新
+    schedule_refresh("tool", 0.15)
 
 def refresh_teammate_panel():
     """安全地刷新队友面板"""
     try:
-        teammate_panel.refresh()
+        schedule_refresh("teammate", 0.2)
     except Exception as e:
         print(f"刷新队友面板失败: {e}")
 
 def refresh_tool_diy_panel():
     try:
-        tool_diy_panel.refresh()
+        ui.timer(0.1, lambda: tool_diy_panel.refresh(), once=True)
     except Exception as e:
         print(f"刷新工具DIY面板失败: {e}")
         traceback.print_exc()
@@ -390,7 +417,8 @@ def stop_timer():
 def start_check_timer():
     global timer_handle
     stop_timer()
-    timer_handle = ui.timer(0.05, check_result)
+    # 降低刷新频率：从 0.05 秒改为 0.1 秒
+    timer_handle = ui.timer(0.1, check_result)
 
 def send_message(prompt: str):
     global is_running, input_field
@@ -429,6 +457,7 @@ def check_result():
                 if CURRENT_ASSISTANT_MSG_INDEX >= 0 and messages[CURRENT_ASSISTANT_MSG_INDEX]["content"] != content:
                     messages[CURRENT_ASSISTANT_MSG_INDEX]["content"] = content
                     save_history()
+                    # 最终结果，直接刷新
                     ui_chat.refresh()
                 elif CURRENT_ASSISTANT_MSG_INDEX == -1:
                     add_assistant_message(content, res.get("tool_calls"))

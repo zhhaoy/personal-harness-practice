@@ -55,16 +55,27 @@ except ImportError:
     print("警告: 未安装 PyYAML，技能加载功能将不可用。请运行: pip install pyyaml")
     yaml = None
 
+# 导入元操作 v3 (总管家模式)
 try:
-    from meta_operation import (
-        run_meta_dispatch, run_meta_status, run_meta_handover,
-        run_meta_feedback, run_meta_improve, run_meta_list,
-        get_dispatcher, ParadigmType
+    from meta_dispatcher_v3 import (
+        run_meta_dispatch, run_meta_step, run_meta_status, run_meta_list,
+        get_dispatcher, init_dispatcher, MetaDispatcherCore, ParadigmType
     )
-    META_OPERATION_AVAILABLE = True
-except ImportError:
-    print("警告: meta_operation 模块未找到，元操作工具将不可用")
-    META_OPERATION_AVAILABLE = False
+    META_DISPATCHER_V3_AVAILABLE = True
+except ImportError as e:
+    print(f"警告: meta_dispatcher_v3 模块未找到: {e}")
+    META_DISPATCHER_V3_AVAILABLE = False
+    # 回退到旧版本
+    try:
+        from meta_operation import (
+            run_meta_dispatch, run_meta_status, run_meta_handover,
+            run_meta_feedback, run_meta_improve, run_meta_list,
+            get_dispatcher, ParadigmType
+        )
+        META_OPERATION_AVAILABLE = True
+    except ImportError:
+        print("警告: meta_operation 模块也未找到，元操作工具将不可用")
+        META_OPERATION_AVAILABLE = False
 
 # ========== 配置常量 ==========
 DEFAULT_TIMEOUT = 120
@@ -1778,8 +1789,41 @@ def _make_base_tools():
     registry.register("workflow_status", "查询工作流当前状态", {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"], },
         lambda **kw: run_workflow_status(kw["session_id"]), builtin=True, editable=False)
     
-    # 元操作工具组
-    if META_OPERATION_AVAILABLE:
+    # 元操作工具组 v3 (总管家模式 - 用户唯一入口)
+    if META_DISPATCHER_V3_AVAILABLE:
+        # 用户唯一入口：启动 workflow
+        registry.register("meta_dispatch", 
+            "【用户唯一入口】启动 workflow，返回第一阶段执行指令。这是你（LLM）应该首先调用的工具！它会识别任务范式并返回具体的执行步骤。",
+            {"type": "object", "properties": {
+                "query": {"type": "string", "description": "用户的原始query"},
+                "context": {"type": "object", "description": "上下文信息（可选）"},
+                "force_paradigm": {"type": "string", "enum": ["CODE_DEV", "FEATURE_DESIGN", "ENGINEERING", "TEST_EVAL", "DOC_WRITING", "DATA_ANALYSIS", "GENERAL"], "description": "强制指定范式（可选）"}
+            }, "required": ["query"]},
+            lambda **kw: run_meta_dispatch(kw["query"], kw.get("context"), kw.get("force_paradigm")), builtin=True, editable=False)
+        
+        # 推进 workflow
+        registry.register("meta_step",
+            "【核心工具】推进 workflow 到下一阶段。在执行完当前阶段的工具调用后，必须调用此工具推进！",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string", "description": "会话ID（从 meta_dispatch 获取）"},
+                "event": {"type": "string", "enum": ["confirm", "execute_done", "verify_pass", "verify_fail", "refine_done"], "description": "触发事件，默认 confirm"},
+                "artifact": {"type": "string", "description": "当前阶段产出（可选）"},
+                "tool_calls": {"type": "array", "description": "当前阶段已执行的工具调用列表（可选）"}
+            }, "required": ["session_id"]},
+            lambda **kw: run_meta_step(kw["session_id"], kw.get("event", "confirm"), kw.get("artifact", ""), kw.get("tool_calls")), builtin=True, editable=False)
+        
+        # 查询状态
+        registry.register("meta_status", "查询当前 workflow 执行状态",
+            {"type": "object", "properties": {"session_id": {"type": "string", "description": "会话ID"}}},
+            lambda **kw: run_meta_status(kw.get("session_id")), builtin=True, editable=False)
+        
+        # 列出流程
+        registry.register("meta_list", "列出所有可用的流程",
+            {"type": "object", "properties": {}},
+            lambda **kw: run_meta_list(), builtin=True, editable=False)
+    
+    elif META_OPERATION_AVAILABLE:
+        # 回退到旧版本
         registry.register("meta_dispatch", "分析用户query，识别行动范式，并调度到对应的元操作工具",
             {"type": "object", "properties": {
                 "query": {"type": "string", "description": "用户的原始query"},
@@ -2137,31 +2181,64 @@ Git 仓库根目录: {REPO_ROOT} (如果为空则不支持 worktree)。创建分
 7. 上下文压缩：compact
 8. 后台命令：background_run, check_background
 9. 工作流工具：workflow_start, workflow_step, workflow_status
-10. 元操作工具（推荐优先使用）：meta_dispatch, meta_status, meta_handover, meta_feedback, meta_improve, meta_list
+10. **元操作总管家（用户唯一入口）**：meta_dispatch, meta_step, meta_status, meta_list
 11. 用户自定义工具
 
-**【重要】元操作工具使用指南**：
-元操作是更高层次的工具抽象，将任务按范式分类并调度到对应的执行流程。推荐优先使用：
+**【最重要】元操作总管家使用方式**：
 
-- **meta_dispatch**: 分析用户query，自动识别范式（CODE_DEV/FEATURE_DESIGN/ENGINEERING/TEST_EVAL等），并调度到对应元操作
-- **meta_status**: 查询当前元操作执行状态
-- **meta_handover**: 将任务移交给其他元操作（如从开发移交到测试）
-- **meta_feedback**: 对元操作结果进行反馈
-- **meta_improve**: 根据反馈改进元操作
-- **meta_list**: 列出所有可用元操作
+你（LLM）应该按照以下方式处理用户任务：
+
+1. **首先调用 meta_dispatch**（用户唯一入口）：
+   - 参数：query = 用户原始请求
+   - 返回：session_id、当前阶段、执行指令
+
+2. **按照指令调用具体工具**：
+   - meta_dispatch 会返回"建议调用的工具"
+   - 根据指令调用 read_file, write_file, bash 等工具
+   - 完成当前阶段任务
+
+3. **调用 meta_step 推进**：
+   - 参数：session_id（从 meta_dispatch 获取），event（默认 "confirm"）
+   - 返回：下一阶段指令
+
+4. **重复步骤 2-3** 直到 meta_step 返回 is_done=true
 
 **范式类型**：
-- CODE_DEV: 代码开发类（实现功能、修复bug、重构代码）
-- FEATURE_DESIGN: 功能设计类（系统设计、架构设计）
-- ENGINEERING: 工程实践类（CI/CD、部署、监控）
-- TEST_EVAL: 测试评估类（编写测试、覆盖率分析）
-- DOC_WRITING: 文档编写类（README、API文档）
-- DATA_ANALYSIS: 数据分析类（数据处理、可视化）
-- GENERAL: 通用问答类（简单问答）
+- CODE_DEV: 代码开发（ARCH → REQ → DESIGN → EXEC → VERIFY → DONE）
+- TEST_EVAL: 测试评估（PLAN → DESIGN → EXEC → REPORT → DONE）
+- FEATURE_DESIGN: 功能设计（ANALYZE → DESIGN → REVIEW → DONE）
+- ENGINEERING: 工程实践（CONFIG → DEPLOY → VERIFY → DONE）
+- DOC_WRITING: 文档编写（PLAN → WRITE → REVIEW → DONE）
+- GENERAL: 通用问答（UNDERSTAND → ANSWER → DONE）
 
-**推荐使用方式**：
-当用户提出任务时，优先调用 meta_dispatch 进行范式识别和自动调度，而不是直接调用原子工具。
-元操作会在内部协调使用 workflow、task 等工具，确保工具调用有章程、不混乱。
+**示例执行流程**：
+```
+用户: "帮我实现一个用户登录功能"
+LLM: 
+  1. 调用 meta_dispatch(query="帮我实现一个用户登录功能")
+     → 返回 session_id="abc123", 当前阶段="ARCH", 建议工具=[read_file, bash]
+  
+  2. 调用 read_file(path="main.py") 了解项目结构
+     调用 bash(command="ls -la") 查看目录
+  
+  3. 调用 meta_step(session_id="abc123", event="confirm")
+     → 返回 当前阶段="REQ", 建议工具=[write_file]
+  
+  4. 调用 write_file(path="requirements.md", content="...")
+  
+  5. 调用 meta_step(session_id="abc123", event="confirm")
+     → 返回 当前阶段="DESIGN"
+  
+  ... 继续直到 DONE
+  
+  6. 当 meta_step 返回 is_done=true 时，任务完成
+```
+
+**重要原则**：
+- meta_dispatch 是用户唯一入口，不要直接调用底层工具
+- 每个阶段完成后必须调用 meta_step 推进
+- 底层工具（read_file, write_file 等）只在流程指令建议时调用
+- 确保 workflow 完整执行，不要中途停止
 
 **任务隔离工作流**：
 - 当你需要处理一个可能与其他工作冲突的任务时，先为该任务创建一个独立的工作树：worktree_create name=短名称 task_id=<任务ID>
