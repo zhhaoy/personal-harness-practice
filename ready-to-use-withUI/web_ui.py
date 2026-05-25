@@ -395,7 +395,30 @@ def run_agent_in_thread(prompt: str):
     CURRENT_ASSISTANT_MSG_INDEX = -1
     try:
         set_teammate_callback(teammate_callback)
-        result: AgentResult = agent_loop(prompt, tool_callback=tool_callback, stream_callback=stream_callback)
+        
+        # 准备历史消息
+        history = []
+        if include_history:
+            for msg in messages:
+                role = msg.get("role")
+                if role in ("user", "assistant"):
+                    content = msg.get("content", "")
+                    if content and len(content) > 10:
+                        history.append({
+                            "role": role,
+                            "content": content[:3000]
+                        })
+            
+            # 限制历史长度
+            if len(history) > 20:
+                history = history[-20:]
+        
+        result: AgentResult = agent_loop(
+            prompt, 
+            tool_callback=tool_callback, 
+            stream_callback=stream_callback,
+            history_messages=history if history else None
+        )
         result_queue.put({
             "type": "final",
             "content": result.final_answer if result.final_answer else "[无输出]",
@@ -629,6 +652,12 @@ def toggle_dark_mode():
 
 input_field = None
 drawer = None
+include_history = True  # 默认携带历史
+
+def toggle_history():
+    global include_history
+    include_history = not include_history
+    ui.notify(f"历史上下文: {'开启' if include_history else '关闭'}", type="info")
 
 def create_ui():
     global input_field, drawer
@@ -641,8 +670,11 @@ def create_ui():
         ui.label("PDM Agent").classes("text-xl font-bold")
         ui.label("Personal Harness").classes("text-sm opacity-80")
         ui.space()
+        # 历史上下文开关
+        ui.button(icon="history", on_click=toggle_history).props("flat round").classes("text-white").tooltip("切换历史上下文")
         # 工具DIY按钮
         ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white")
+        ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white")
         ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white")
 
     # 右侧可滑动抽屉（工具DIY区域）

@@ -55,27 +55,16 @@ except ImportError:
     print("警告: 未安装 PyYAML，技能加载功能将不可用。请运行: pip install pyyaml")
     yaml = None
 
-# 导入元操作 v3 (总管家模式)
+# 导入元操作总管家
 try:
-    from meta_dispatcher_v3 import (
+    from meta_dispatcher import (
         run_meta_dispatch, run_meta_step, run_meta_status, run_meta_list,
         get_dispatcher, init_dispatcher, MetaDispatcherCore, ParadigmType
     )
-    META_DISPATCHER_V3_AVAILABLE = True
+    META_DISPATCHER_AVAILABLE = True
 except ImportError as e:
-    print(f"警告: meta_dispatcher_v3 模块未找到: {e}")
-    META_DISPATCHER_V3_AVAILABLE = False
-    # 回退到旧版本
-    try:
-        from meta_operation import (
-            run_meta_dispatch, run_meta_status, run_meta_handover,
-            run_meta_feedback, run_meta_improve, run_meta_list,
-            get_dispatcher, ParadigmType
-        )
-        META_OPERATION_AVAILABLE = True
-    except ImportError:
-        print("警告: meta_operation 模块也未找到，元操作工具将不可用")
-        META_OPERATION_AVAILABLE = False
+    print(f"警告: meta_dispatcher 模块未找到: {e}")
+    META_DISPATCHER_AVAILABLE = False
 
 # ========== 配置常量 ==========
 DEFAULT_TIMEOUT = 120
@@ -1789,8 +1778,8 @@ def _make_base_tools():
     registry.register("workflow_status", "查询工作流当前状态", {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"], },
         lambda **kw: run_workflow_status(kw["session_id"]), builtin=True, editable=False)
     
-    # 元操作工具组 v3 (总管家模式 - 用户唯一入口)
-    if META_DISPATCHER_V3_AVAILABLE:
+    # 元操作工具组 (总管家模式 - 用户唯一入口)
+    if META_DISPATCHER_AVAILABLE:
         # 用户唯一入口：启动 workflow
         registry.register("meta_dispatch", 
             "【用户唯一入口】启动 workflow，返回第一阶段执行指令。这是你（LLM）应该首先调用的工具！它会识别任务范式并返回具体的执行步骤。",
@@ -1819,44 +1808,6 @@ def _make_base_tools():
         
         # 列出流程
         registry.register("meta_list", "列出所有可用的流程",
-            {"type": "object", "properties": {}},
-            lambda **kw: run_meta_list(), builtin=True, editable=False)
-    
-    elif META_OPERATION_AVAILABLE:
-        # 回退到旧版本
-        registry.register("meta_dispatch", "分析用户query，识别行动范式，并调度到对应的元操作工具",
-            {"type": "object", "properties": {
-                "query": {"type": "string", "description": "用户的原始query"},
-                "context": {"type": "object", "description": "上下文信息（可选）"},
-                "force_paradigm": {"type": "string", "enum": ["CODE_DEV", "FEATURE_DESIGN", "ENGINEERING", "TEST_EVAL", "DOC_WRITING", "DATA_ANALYSIS", "GENERAL"]}
-            }, "required": ["query"]},
-            lambda **kw: run_meta_dispatch(kw["query"], kw.get("context"), kw.get("force_paradigm")), builtin=True, editable=False)
-        registry.register("meta_status", "查询当前元操作的执行状态、进度和产出物",
-            {"type": "object", "properties": {"session_id": {"type": "string", "description": "会话ID（可选，默认为当前会话）"}}},
-            lambda **kw: run_meta_status(kw.get("session_id")), builtin=True, editable=False)
-        registry.register("meta_handover", "将当前任务移交给其他元操作，保留上下文和进度",
-            {"type": "object", "properties": {
-                "target_paradigm": {"type": "string", "description": "目标范式"},
-                "reason": {"type": "string", "description": "移交原因"},
-                "carry_context": {"type": "boolean", "description": "是否携带当前上下文", "default": True}
-            }, "required": ["target_paradigm", "reason"]},
-            lambda **kw: run_meta_handover(kw["target_paradigm"], kw["reason"], kw.get("carry_context", True)), builtin=True, editable=False)
-        registry.register("meta_feedback", "用户对元操作执行结果的反馈，用于改进元操作",
-            {"type": "object", "properties": {
-                "session_id": {"type": "string"},
-                "rating": {"type": "integer", "minimum": 1, "maximum": 5, "description": "满意度评分"},
-                "feedback_text": {"type": "string", "description": "具体反馈内容"},
-                "issue_type": {"type": "string", "enum": ["wrong_paradigm", "incomplete", "tool_misuse", "performance", "other"]}
-            }, "required": ["session_id", "rating"]},
-            lambda **kw: run_meta_feedback(kw["session_id"], kw["rating"], kw.get("feedback_text", ""), kw.get("issue_type")), builtin=True, editable=False)
-        registry.register("meta_improve", "根据用户反馈或问题，改进元操作工具的实现",
-            {"type": "object", "properties": {
-                "paradigm": {"type": "string", "description": "要改进的元操作范式"},
-                "improvement_request": {"type": "string", "description": "改进需求描述"},
-                "auto_validate": {"type": "boolean", "description": "是否自动验证改进结果", "default": True}
-            }, "required": ["paradigm", "improvement_request"]},
-            lambda **kw: run_meta_improve(kw["paradigm"], kw["improvement_request"], kw.get("auto_validate", True)), builtin=True, editable=False)
-        registry.register("meta_list", "列出所有可用的元操作",
             {"type": "object", "properties": {}},
             lambda **kw: run_meta_list(), builtin=True, editable=False)
 
@@ -2268,11 +2219,54 @@ LLM:
 class MultiModelClient:
     def __init__(self):
         api_base = os.getenv("LLM_API_BASE")
-        api_key = os.getenv("LLM_API_KEY")
+        api_key = os.getenv("API_KEY") or os.getenv("LLM_API_KEY")  # 兼容两种变量名
         self.model = os.getenv("LLM_MODEL")
         if not all([api_base, api_key, self.model]):
-            raise ValueError("请设置环境变量: LLM_API_BASE, LLM_API_KEY, LLM_MODEL")
-        self.client = OpenAI(base_url=api_base, api_key=api_key, timeout=60.0, max_retries=2)
+            raise ValueError("请设置环境变量: LLM_API_BASE, LLM_API_KEY (或 API_KEY), LLM_MODEL")
+        
+        # 增强超时配置：连接超时 30s，读取超时 180s
+        import httpx
+        
+        # 支持代理环境变量
+        proxies = None
+        if os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY"):
+            proxies = {
+                "http://": os.getenv("HTTP_PROXY"),
+                "https://": os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"),
+            }
+        
+        http_client = httpx.Client(
+            timeout=httpx.Timeout(30.0, read=180.0, write=60.0, connect=30.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+            proxy=proxies.get("https://") if proxies else None,
+        )
+        
+        self.client = OpenAI(
+            base_url=api_base, 
+            api_key=api_key, 
+            timeout=180.0,  # 增加总超时
+            max_retries=3,   # 增加重试次数
+            http_client=http_client
+        )
+    
+    def _retry_on_timeout(self, func, *args, max_retries=3, **kwargs):
+        """带重试的调用"""
+        import time
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                if "timeout" in error_str or "timed out" in error_str or "connection" in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # 指数退避
+                        print(f"\n[网络超时，{wait_time}秒后重试 ({attempt+1}/{max_retries})]")
+                        time.sleep(wait_time)
+                        continue
+                raise
+        raise last_error
 
     def chat(self, messages: List[Dict], tools: List[Dict], stream: bool = False, stream_callback: Optional[Callable[[str], None]] = None) -> Dict:
         clean_messages = clean_ellipsis(messages)
@@ -2289,10 +2283,13 @@ class MultiModelClient:
                 return self._chat_no_stream(clean_messages, clean_tools)
 
     def _chat_no_stream(self, messages: List[Dict], tools: List[Dict]) -> Dict:
-        try:
-            response = self.client.chat.completions.create(
+        def _call_api():
+            return self.client.chat.completions.create(
                 model=self.model, messages=messages, tools=tools if tools else None,
                 tool_choice="auto" if tools else None, temperature=0.7, max_tokens=4096)
+        
+        try:
+            response = self._retry_on_timeout(_call_api, max_retries=3)
             choice = response.choices[0]
             message = choice.message
             tool_calls = []
@@ -2302,7 +2299,19 @@ class MultiModelClient:
                                        "function": {"name": tc.function.name, "arguments": tc.function.arguments}})
             return {"content": message.content or "", "tool_calls": tool_calls, "finish_reason": choice.finish_reason}
         except APIError as e:
+            error_msg = str(e)
+            # 增强错误提示
+            if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                help_msg = "\n提示: 请检查网络连接或设置代理环境变量 (HTTP_PROXY/HTTPS_PROXY)"
+                return {"content": "", "tool_calls": [], "finish_reason": "error", 
+                        "error": f"网络超时: {error_msg}{help_msg}"}
             return {"content": "", "tool_calls": [], "finish_reason": "error", "error": f"API错误: {e}"}
+        except Exception as e:
+            error_msg = str(e)
+            if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                return {"content": "", "tool_calls": [], "finish_reason": "error", 
+                        "error": f"网络超时: {error_msg}\n提示: 请检查网络连接或设置代理"}
+            return {"content": "", "tool_calls": [], "finish_reason": "error", "error": f"调用失败: {str(e)}"}
         except Exception as e:
             return {"content": "", "tool_calls": [], "finish_reason": "error", "error": f"调用失败: {str(e)}"}
 
@@ -2367,17 +2376,57 @@ class AgentResult:
     error: Optional[str] = None
 
 # ========== 主控循环 ==========
-def agent_loop(initial_prompt: str, max_iterations: int = 200, tool_callback: Optional[Callable] = None, stream_callback: Optional[Callable[[str], None]] = None) -> AgentResult:
+def agent_loop(
+    initial_prompt: str, 
+    max_iterations: int = 200, 
+    tool_callback: Optional[Callable] = None, 
+    stream_callback: Optional[Callable[[str], None]] = None,
+    history_messages: List[Dict] = None
+) -> AgentResult:
+    """
+    Agent 主循环
+    
+    Args:
+        initial_prompt: 用户的当前输入
+        max_iterations: 最大迭代次数
+        tool_callback: 工具调用回调
+        stream_callback: 流式输出回调
+        history_messages: 历史消息列表（用于恢复上下文）
+    
+    Returns:
+        AgentResult: 包含最终答案和工具调用记录
+    """
     try:
         llm = MultiModelClient()
     except ValueError as e:
         return AgentResult(final_answer="", error=str(e))
 
     system_prompt = get_dynamic_system_prompt()
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": initial_prompt}
-    ]
+    
+    # 构建消息列表：系统提示 + 历史 + 当前输入
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # 添加历史消息（排除系统消息和工具调用细节）
+    if history_messages:
+        for msg in history_messages:
+            role = msg.get("role")
+            # 只保留 user 和 assistant 消息
+            if role in ("user", "assistant"):
+                content = msg.get("content", "")
+                if content and len(content) > 20:  # 过滤太短的消息
+                    # 截断过长的消息
+                    if len(content) > 2000:
+                        content = content[:2000] + "\n...[已截断]"
+                    messages.append({"role": role, "content": content})
+        
+        # 如果历史过长，添加摘要提示
+        if len(messages) > 10:
+            summary_hint = {"role": "user", "content": "[历史对话较长，请根据上下文继续]"}
+            messages.insert(-1, summary_hint)
+    
+    # 添加当前用户输入
+    messages.append({"role": "user", "content": initial_prompt})
+    
     tool_records: List[ToolCallRecord] = []
 
     # 预分析（保持不变）
