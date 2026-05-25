@@ -1,35 +1,46 @@
-# 🤖 Personal Harness — 个人智能体基础设施框架 Personal Agent Infrastructure Framework
+# Personal Harness
 
-**大模型唯一的「手脚」，就是工具。**
+**Personal Agent Infrastructure Framework / 个人智能体基础设施框架**
+
 **The only "hands and feet" of a Large Language Model are tools.**
+**大模型唯一的「手脚」，就是工具。**
 
-**每个用户都可搭建属于自己的「智能体运行底座」，这个底座，最小构建单元就是工具。**
-**Every user can build their own "Agent runtime base", and the smallest building block of this base is the tool.**
+---
 
-**任何需求/规则皆可工具化**：
-- **文件读写**
-- **网络访问**
-- **技能加载**
-- **记忆存储/加载**
-- **上下文隔离**
-- **团队创建/任务发布/自主认领**
-- **任务隔离**
-- ... 
+## Documentation / 文档
 
-**Any requirement/rule can be turned into a tool**:
-- File reading/writing
-- Network access
-- Skill loading
-- Memory storage/loading
-- Context isolation
-- Team creation / task publishing / autonomous claiming
-- Task isolation
-- ... 
+- **[English README](README_EN.md)**
+- **[中文说明](README_CN.md)**
 
-**你要做的，就是不断完善这个底座，不断添加工具，让智能体不断成长、不断进化。**
-**What you need to do is continuously improve this base, keep adding tools, and let your Agent grow and evolve.**
+---
 
+## Quick Links / 快速链接
 
-> **- 详见 README_CN.md**
+| Item | Link |
+|------|------|
+| Architecture / 架构说明 | [AGENTS.md](AGENTS.md) |
+| Network Guide / 网络指南 | [NETWORK_GUIDE.md](NETWORK_GUIDE.md) |
+| Design Docs / 设计文档 | [design/](design/) |
 
-> **- For details, refer to README_EN.md**
+---
+
+## Quick Start / 快速开始
+
+```bash
+# Install dependencies / 安装依赖
+pip install nicegui openai prompt-toolkit pyyaml requests httpx python-dotenv
+
+# Configure environment / 配置环境
+export LLM_API_BASE="your_endpoint"
+export LLM_API_KEY="your_key"
+export LLM_MODEL="your_model"
+
+# Run Web UI / 运行 Web 界面
+python src/web_ui.py
+```
+
+---
+
+## License / 许可证
+
+MIT License

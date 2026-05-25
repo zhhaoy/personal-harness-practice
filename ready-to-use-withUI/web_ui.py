@@ -505,12 +505,12 @@ def ui_chat():
             role = msg.get("role")
             if role == "user":
                 with ui.row().classes("justify-end w-full"):
-                    with ui.card().classes("bg-blue-100 dark:bg-blue-900 max-w-[80%]").props("flat"):
-                        ui.markdown(msg["content"]).classes("text-sm")
+                    with ui.card().classes("bg-blue-100 dark:bg-blue-900 max-w-[80%] break-words overflow-wrap-anywhere").props("flat"):
+                        ui.markdown(msg["content"]).classes("text-sm prose prose-sm max-w-none dark:prose-invert")
             elif role == "assistant":
                 with ui.row().classes("justify-start w-full"):
-                    with ui.card().classes("bg-gray-100 dark:bg-gray-800 max-w-[80%]").props("flat"):
-                        ui.markdown(msg["content"]).classes("text-sm")
+                    with ui.card().classes("bg-gray-100 dark:bg-gray-800 max-w-[80%] break-words overflow-wrap-anywhere").props("flat"):
+                        ui.markdown(msg["content"]).classes("text-sm prose prose-sm max-w-none dark:prose-invert")
 
 @ui.refreshable
 def teammate_panel():
@@ -645,26 +645,101 @@ def clear_history():
     teammate_panel.refresh()
     ui.notify("会话已清空", type="info")
 
-def toggle_dark_mode():
-    ui.dark_mode().toggle()
-    app.storage.user['dark_mode'] = ui.dark_mode().value
-    ui.update()
-
 input_field = None
 drawer = None
 include_history = True  # 默认携带历史
+_dark_mode_ref = None  # 保存 dark_mode 实例引用
 
 def toggle_history():
     global include_history
     include_history = not include_history
     ui.notify(f"历史上下文: {'开启' if include_history else '关闭'}", type="info")
 
+def toggle_dark_mode():
+    global _dark_mode_ref
+    if _dark_mode_ref:
+        _dark_mode_ref.toggle()
+        app.storage.user['dark_mode'] = _dark_mode_ref.value
+
 def create_ui():
-    global input_field, drawer
+    global input_field, drawer, _dark_mode_ref
     ui.page_title("PDM Agent – 任务隔离助手")
 
     dark_mode_saved = app.storage.user.get('dark_mode', False)
-    ui.dark_mode().value = dark_mode_saved
+    _dark_mode_ref = ui.dark_mode(value=dark_mode_saved)
+
+    ui.add_head_html('''
+    <style>
+        .prose pre {
+            background-color: #1e1e1e !important;
+            border-radius: 8px;
+            padding: 12px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+        .prose code {
+            background-color: rgba(127, 127, 127, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        .prose pre code {
+            background-color: transparent;
+            padding: 0;
+        }
+        .prose blockquote {
+            border-left: 4px solid #10a37f;
+            padding-left: 12px;
+            margin: 8px 0;
+            color: #666;
+        }
+        .dark .prose blockquote {
+            color: #aaa;
+        }
+        .prose table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 8px 0;
+        }
+        .prose th, .prose td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .dark .prose th, .dark .prose td {
+            border-color: #444;
+        }
+        .prose th {
+            background-color: rgba(127, 127, 127, 0.1);
+        }
+        .prose h1, .prose h2, .prose h3, .prose h4 {
+            color: #10a37f;
+            margin-top: 16px;
+            margin-bottom: 8px;
+        }
+        .prose ul, .prose ol {
+            padding-left: 20px;
+            margin: 8px 0;
+        }
+        .prose li {
+            margin: 4px 0;
+        }
+        .prose hr {
+            border-color: #10a37f;
+            margin: 16px 0;
+        }
+        .prose a {
+            color: #10a37f;
+            text-decoration: underline;
+        }
+        .prose strong {
+            font-weight: 600;
+        }
+        .prose em {
+            font-style: italic;
+        }
+    </style>
+    ''')
 
     with ui.header().classes("bg-primary text-white p-4"):
         ui.label("PDM Agent").classes("text-xl font-bold")
@@ -672,10 +747,8 @@ def create_ui():
         ui.space()
         # 历史上下文开关
         ui.button(icon="history", on_click=toggle_history).props("flat round").classes("text-white").tooltip("切换历史上下文")
-        # 工具DIY按钮
-        ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white")
-        ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white")
-        ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white")
+        ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white").tooltip("工具DIY")
+        ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white").tooltip("切换深色模式")
 
     # 右侧可滑动抽屉（工具DIY区域）
     with ui.right_drawer(fixed=False, value=False).classes("bg-gray-100 dark:bg-gray-900 p-4 w-96") as drawer:

@@ -1,179 +1,201 @@
-# 🤖 Personal Harness — Personal Agent Infrastructure Framework
+# Personal Harness
+
+**A Personal Agent Infrastructure Framework**
+
+## Introduction
 
 **The only "hands and feet" of a Large Language Model are tools.**
 
-**Every user can build their own "Agent runtime base", and the smallest building block of this base is the tool.**
+Every user can build their own "Agent runtime base", where the smallest building block is a tool. Any requirement, any rule can be transformed into a tool:
 
-**Any requirement/rule can be turned into a tool**:
-- File reading/writing
+- File read/write
 - Network access
 - Skill loading
-- Memory storage/loading
+- Memory storage
 - Context isolation
-- Team creation / task publishing / autonomous claiming
+- Team collaboration
 - Task isolation
-- ... 
+- ...
 
-**What you need to do is continuously improve this base, keep adding tools, and let your Agent grow and evolve.**
+Your mission is to continuously improve this base, keep adding tools, and let your Agent grow and evolve.
 
-## 📌 Concept Definition
+## Core Concepts
 
-Besides the underlying dependencies (LLM API, computing environment), an Agent also needs a **framework** to connect itself with those dependencies. This framework is called **Harness**, which includes both general-purpose tools and application-specific tools.
+### Harness (Agent Framework)
 
-- **General-purpose tools**  
-  Core cross-platform capabilities: file reading/writing, context compression, skill loading, task publishing and dashboard, autonomous team collaboration, Git Worktree task isolation, etc.
+Beyond the underlying dependencies (LLM API, computing environment), an Agent needs a **framework** layer to connect the Agent with these dependencies. This layer is called **Harness**.
 
-- **Application-specific tools**  
-  On top of the general layer, developers can mount **personal development tools or plugins** as needed (e.g., internal API calls, code review hooks, database queries, etc.).
+- **General-purpose Tools**: Cross-platform core capabilities such as file I/O, context compression, skill loading, task publishing, team collaboration, etc.
+- **Application-specific Tools**: Personal tools or plugins that developers can mount on demand
 
-> Personal Harness = General Harness + Personal Toolbox
+> The core LLM loop of this project, `agent_loop.py`, is developed and extended step by step based on "`design/01-10 完整需求文档.md`". Each `agent_loop.py` in the "`agents/`" directory strictly corresponds to the respective section in "`design/01-10 完整需求文档.md`", allowing each corresponding `agent_loop.py` to be run section by section.
 
-## 🧱 Structural Paradigm
+> At the same time, adhering to the aforementioned philosophy of "everything can be toolified", this project further extends the toolset based on "`10-agent_loop.py`", adding a new set of meta-operational tools called "process tools", and re-stratifies the hierarchy, ultimately forming the architectural shape described below.
 
-```text
-+
-Hot-reloadable Tool Matrix
-├── General-purpose tools (read/write, network, skill, compression, task publishing, autonomous team, worktree…)
-└── Personal specific tools (DIY or from plugin marketplace)
+### Tool Matrix Architecture
+
+This project adopts a **Layered Tool Matrix Architecture**, with the Meta Dispatcher as the core, managing workflows through process-driven execution.
+
+```
+User Layer (Single Entry Point)
+       │
+       ▼
+  meta_dispatch (Grand Steward)
+       │
+       │ Identify paradigm, create session
+       │ Return first phase instruction
+       ▼
+  Workflow Execution
+       │
+       │ LLM calls specific tools
+       │ meta_step advances to next phase
+       ▼
+  Process Layer
+       │
+       │ CODE_DEV | TEST_EVAL | FEATURE_DESIGN
+       │ ENGINEERING | DOC_WRITING | GENERAL
+       ▼
+  Tool Matrix Layer
+       │
+       │ File | Task | Team | Workflow tools
+       │ 30+ tools, invisible to users
+       ▼
 ```
 
-- **Core Loop**: A purely tool-driven Agent loop. Any LLM action is associated with a tool call, so the loop ends when no more tool calls are needed.
-- **Hot-Reload**: Add or modify tools without restarting the main program (dynamically loaded via function mapping).
-- **Extension-Friendly**: Each tool is an independent function registered into the tool matrix by category.
+### User-Visible Tools
 
-## 🛤️ Implementation Path for General-Purpose Tools of the Agent Base (01→10)
+Users only interact with two tools:
 
-This project implements all mechanisms from the minimal core loop to the complete general-purpose tool set incrementally through 10 Python scripts.
+| Tool | Purpose |
+|------|---------|
+| `meta_dispatch` | Entry point - Start workflow, returns first phase instruction |
+| `meta_step` | Advance - Move to next phase after completing current tasks |
 
-1. Design first: in the `design/` folder, there are ten chapters, each adding a requirement/rule, broken down into one or more tools.
+## Project Structure
 
-2. Each chapter corresponds to a `.py` file (located in the `agents/` folder), each runnable independently, incrementally implementing the mentioned tools, with validation questions.
-
-| Chapter | Core Mechanism | Increment |
-|:---:|:---|:---|
-| 01 | Core loop + basic file tools | Minimal runnable agent |
-| 02 | Tool dispatch matrix + path sandbox | Safe execution of basic operations |
-| 03 | ToDo planning tool | Guide agent to plan before acting |
-| 04 | `task` subagent (context isolation) | Isolate subtasks from main flow |
-| 05 | `load_skill` progressive skill loading | On-demand loading of prompts from `skills/` |
-| 06 | Three-level context compression | Micro compression, auto compression, manual compression |
-| 07 | `background_run` background task | Run long-running commands in parallel |
-| 08 | Persistent teammates + async mailbox | Multi-agent collaboration foundation |
-| 09 | Autonomous agents + task board polling | Teammates auto-claim tasks |
-| 10 | Git Worktree task isolation | Each task gets its own worktree, no conflicts in parallel |
-
-> Full verification questions can be found in `design/01-10 完整需求文档.md`
-
-> Thanks to the [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) project for providing excellent design ideas, implementation examples, and teaching iteration methodology.
-
-## 📁 Project Structure
-
-```text
+```
 .
-├── agents/                 # 10 incremental scripts (01 to 10)
-│ ├── 01-agent_loop.py
-│ ├── ...
-│ └── 10-agent_loop.py      # Final complete version (full-featured Harness)
-├── design/                 # 10 chapter design docs
-├── skills/                 # Optional skills directory (SKILL.md)
-├── ready-to-go-withUI/     # 🎯 Anticipated good practice 1: UI example (WIP)
-│ ├── agent_loop.py         # Adapted for hot‑reload, editable tool matrix
-│ └── web_ui.py             # Conversation UI + DIY tool panel
-├── .env.example
-├── requirements.txt
-├── README_CN.md
-└── README_EN.md
+├── ready-to-use-withUI/        # Source code
+│   ├── agent_loop.py           # Core Agent loop
+│   ├── meta_dispatcher.py      # Meta dispatcher (Grand Steward)
+│   ├── process_definition.py   # Process definitions
+│   ├── tool_matrix.py          # Tool matrix
+│   └── web_ui.py               # Web interface
+├── design/                     # Design documents
+│   ├── meta_operation_architecture.md
+│   ├── meta_operation_design.md
+│   ├── tool_matrix_layer_architecture.md
+│   └── tool_matrix_layer_design.md
+├── AGENTS.md                   # Agent configuration
+├── NETWORK_GUIDE.md            # Network configuration guide
+├── README.md                   # Project entry
+├── README_CN.md                # Chinese README
+└── README_EN.md                # English README
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
-### 1. Requirements
+### Requirements
 
 - Python 3.10+
-- Git (required for worktree in Chapter 10)
-- OpenAI API-compatible model service (GLM / DeepSeek / Qwen, etc.)
+- OpenAI API compatible model service
 
-### 2. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Configure environment variables
+### Install Dependencies
 
 ```bash
-cp .env.example .env
-# Edit .env and fill in LLM_API_BASE, LLM_API_KEY, LLM_MODEL
+pip install nicegui openai prompt-toolkit pyyaml requests httpx python-dotenv
 ```
 
-Alternatively, set the three variables directly in your environment — simple and easy.
-
-### 4. Run a script
+### Configure Environment Variables
 
 ```bash
-python agents/10-agent_loop.py   # Run the final complete version
+# Required
+export LLM_API_BASE="your_api_endpoint"
+export LLM_API_KEY="your_api_key"
+export LLM_MODEL="your_model_name"
 ```
 
-Then enter natural language tasks at the prompt, and the Agent will automatically call the appropriate tools.
+### Run
 
-## ✨ Anticipated Good Practices (To Be Continuously Improved)
+**CLI Mode:**
 
-### Practice I: UI Version (DIY Tool Panel)
+```bash
+python ready-to-use-withUI/agent_loop.py
+```
 
-Located in the `ready-to-go-withUI/` folder.  
-Run `web_ui.py` to open a web chat interface. Currently, you can chat with the Agent and use the tools developed in steps 01-10.
+**Web UI Mode (Recommended):**
 
-*In the future*: you can describe and customize the tools you want using natural language, either in the interface or in a specific area. The Agent will:
+```bash
+python ready-to-use-withUI/web_ui.py
+# Visit http://localhost:8080
+```
 
-- Complete and implement the functionality
-- Automatically verify correctness
-- Insert the functionality as a **personal specific tool** into the Harness tool matrix and enable it immediately
+## Web UI Features
 
-> Example: *"Create a tool that can query current weather"* → Agent automatically writes the function, registers it in the tool matrix, and hot-reloads it.
+- Real-time streaming output
+- Tool call visualization
+- Dark mode toggle
+- Session persistence
+- Tool DIY panel: Enable/disable built-in tools, create custom tools
+- Teammate activity panel: Multi-agent collaboration messages
 
-The basic concept is already implemented but still needs further refinement.
+## Process Types
 
-### Practice II: Plugin Marketplace Version
+| Process | Phases | Use Case |
+|---------|--------|----------|
+| code_development | ARCH → REQ → DESIGN → EXEC → VERIFY → DONE | Code development |
+| test_evaluation | PLAN → DESIGN → EXEC → REPORT → DONE | Test evaluation |
+| feature_design | ANALYZE → DESIGN → REVIEW → DONE | Feature design |
+| engineering | CONFIG → DEPLOY → VERIFY → DONE | Engineering deployment |
+| documentation | PLAN → WRITE → REVIEW → DONE | Documentation writing |
+| general_qa | UNDERSTAND → ANSWER → DONE | General Q&A |
 
-**Under planning**: support remote acquisition or upload of personal tools via a plugin marketplace.
+## Tool Overview
 
-- General Harness as the base
-- Plugin packages follow standard interfaces (function signature, schema definition)
-- One-click install / publish to private or public marketplaces
+| Category | Tools | Description |
+|----------|-------|-------------|
+| Basic | `read_file`, `write_file`, `edit_file`, `bash` | File and command operations |
+| Planning | `todo` | Todo list management |
+| Sub-agent | `task` | Context-isolated subtasks |
+| Skill | `load_skill` | Load skills on demand |
+| Compression | `compact` | Context compression |
+| Background | `background_run`, `check_background` | Parallel task execution |
+| Team | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox` | Multi-agent collaboration |
+| Task | `task_create`, `task_list`, `task_update` | Task board management |
+| Worktree | `worktree_create`, `worktree_run` | Git worktree management |
 
-Let Personal Harness become a **growable agent operating system**.
+## Permission Matrix
 
-## 🧰 Current Available Tools (Final version: `10-agent_loop.py`)
+Different processes have different tool access permissions:
 
-| Category | Tool Name | Description |
-|:---|:---|:---|
-| Basic | `read_file`, `write_file`, `edit_file`, `bash` | Sandboxed file and command operations |
-| Planning | `todo` | Internal todo list |
-| Subagent | `task` | One-off isolated subtask |
-| Skill | `load_skill` | Load skills from `skills/` on demand |
-| Compression | `compact` | Manually trigger context compression |
-| Background | `background_run`, `check_background` | Run long-running commands in parallel |
-| Team | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox`, `broadcast` | Persistent teammates + mailbox communication |
-| Protocol | `shutdown_request`, `plan_approval` | Teammate shutdown and plan approval |
-| Task Isolation | `task_create`, `task_list`, `task_get`, `task_update`, `task_bind_worktree` | Task board management |
-| Worktree | `worktree_create`, `worktree_list`, `worktree_run`, … | Git worktree lifecycle |
+| Process | File Tools | Task Tools | Team Tools | Workflow Tools |
+|---------|:----------:|:----------:|:----------:|:--------------:|
+| CODE_DEV | ✅ | ✅ | ✅ | ✅ |
+| TEST_EVAL | ✅ | ✅ | ❌ | ❌ |
+| FEATURE_DESIGN | ✅ | ❌ | ❌ | ❌ |
+| ENGINEERING | ✅ | ✅ | ✅ | ❌ |
+| DOC_WRITING | ✅ | ❌ | ❌ | ❌ |
+| GENERAL | ✅ | ❌ | ❌ | ❌ |
 
-## 📌 Notes
+## Runtime Data
 
-- The final version `10-agent_loop.py` requires the current directory to be a **Git repository**, otherwise worktree tools will not work.
-- Teammate threads are based on `threading` — lightweight with no extra dependencies.
-- All runtime data is stored in `.transcripts/` (conversation compression), `.tasks/` (task board), `.worktrees/` (worktrees), `.team/` (team configuration) , and `.tools/` (custom personal tools), all can be safely deleted.
-- Environment variables must be correctly configured.
+All runtime data is stored in the following directories and can be safely deleted:
 
----
+- `.transcripts/` - Conversation compression records
+- `.tasks/` - Task board data
+- `.worktrees/` - Worktree states
+- `.team/` - Team configurations
+- `.tools/` - Custom tools
 
-## 📄 License
+## Network Configuration
 
-MIT License — free to use, modify, and distribute.
+If you encounter network timeouts, please refer to `NETWORK_GUIDE.md` for proxy configuration or timeout adjustment.
 
----
+## License
 
-## 🙏 Acknowledgements
+MIT License
 
-- [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) for providing excellent design ideas, implementation examples, and iterative teaching methods.
-- GLM / DeepSeek / Qwen and other open-source model communities.
+## Acknowledgments
+
+- [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) for excellent design inspiration
+- GLM / DeepSeek / Qwen open-source model communities

@@ -10,6 +10,7 @@ dependencies = [
     "prompt-toolkit>=3.0.52",
     "pyyaml>=6.0.3",
     "requests>=2.33.1",
+    "httpx>=0.27.0",
 ]
 
 [[tool.uv.index]]

@@ -1,182 +1,201 @@
-# 🤖 Personal Harness — 个人智能体基础设施框架
+# Personal Harness
 
-**大模型唯一的「手脚」，就是工具。**
+**个人智能体基础设施框架**
 
-**每个用户都可搭建属于自己的「智能体运行底座」，这个底座，最小构建单元就是工具。**
+## 简介
 
-**任何需求/规则皆可工具化**：
-- **文件读写**
-- **网络访问**
-- **技能加载**
-- **记忆存储/加载**
-- **上下文隔离**
-- **团队创建/任务发布/自主认领**
-- **任务隔离**
-- ... 
+大模型唯一的「手脚」，就是工具。
 
-**你要做的，就是不断完善这个底座，不断添加工具，让智能体不断成长、不断进化。**
+每个用户都可以搭建属于自己的「智能体运行底座」，这个底座的最小构建单元就是工具。任何需求、任何规则都可以被工具化：
 
-## 📌 概念定义
+- 文件读写
+- 网络访问
+- 技能加载
+- 记忆存储
+- 上下文隔离
+- 团队协作
+- 任务隔离
+- ...
 
-Agent 运行除了底层依赖（LLM API、计算环境），还需要一层**框架**来连接 Agent 与底层依赖。这层框架称为 **Harness**，包含通用层工具和特定应用层工具。
+你要做的，就是不断完善这个底座，不断添加工具，让智能体不断成长、不断进化。
 
-- **通用层工具**  
-  包含跨平台通用的核心能力：文件读写、上下文压缩、技能（Skill）加载、任务发布与看板、自主团队协作、Git Worktree 任务隔离，等等。
+## 核心概念
 
-- **特定应用层工具**  
-  在通用层之上，开发者按需挂载**个人开发工具或插件**（如内部 API 调用、代码审查钩子、数据库查询等）。
+### Harness（智能体框架）
 
-> Personal Harness = 通用 Harness + 私人工具箱
+Agent 运行除了底层依赖（LLM API、计算环境），还需要一层**框架**来连接 Agent 与底层依赖。这层框架称为 **Harness**。
 
-## 🧱 结构范式
+- **通用层工具**：跨平台通用的核心能力，如文件读写、上下文压缩、技能加载、任务发布、团队协作等
+- **特定应用层工具**：开发者按需挂载的个人工具或插件
 
-```text
-+
-可热重载的 工具矩阵
-├── 通用工具（读写、网络、skill、压缩、任务发布、自主团队、工作树…）
-└── 个人特定工具（DIY 或从插件市场获取）
+> 本项目的核心LLM循环 agent_loop.py ，是依据 “design/01-10 完整需求文档.md” 一步一步开发、扩展而来，“agents/”中的每一个 agent_loop.py ，与 “design/01-10 完整需求文档.md” 中的对应章节严格对应，可以逐个章节运行对应的 agent_loop.py。
+
+> 同时本项目贯彻前述“一切均可工具化”的理念，在“10-agent_loop.py”基础上再次扩展工具集，新增“流程工具”这种元操作工具集，并重新进行层级分划，最终形成下述架构形态。
+
+### 工具矩阵架构
+
+本项目采用**分层工具矩阵架构**，以元操作总管家为核心，通过流程驱动的方式管理工作流。
+
+```
+用户层（唯一入口）
+       │
+       ▼
+  meta_dispatch（总管家）
+       │
+       │ 识别范式，创建 session
+       │ 返回第一阶段指令
+       ▼
+  Workflow Execution
+       │
+       │ LLM 调用具体工具
+       │ meta_step 推进到下一阶段
+       ▼
+  Process Layer（流程层）
+       │
+       │ CODE_DEV | TEST_EVAL | FEATURE_DESIGN
+       │ ENGINEERING | DOC_WRITING | GENERAL
+       ▼
+  Tool Matrix Layer（工具矩阵层）
+       │
+       │ 文件工具 | 任务工具 | 团队工具 | 工作流工具
+       │ 30+ 工具，用户不可见，仅被流程调用
+       ▼
 ```
 
-- **核心循环**：纯工具驱动的 Agent Loop，LLM 的任何动作都关联一个工具调用，所以循环结束标志，是不再有工具调用需求  
-- **热重载**：新增或修改工具无需重启主程序（通过函数映射动态加载） 
-- **扩展友好**：每个工具都是一个独立函数，按分类注册到工具矩阵
+### 用户可见工具
 
-## 🛤️ 智能体底座通用层工具实现路径（01→10）
+用户只需操作两个工具：
 
-本项目通过 **10 个增量式 Python 脚本**，循序渐进地实现了从最小核心循环到完整 通用层工具 的全部机制。
+| 工具 | 用途 |
+|------|------|
+| `meta_dispatch` | 入口 - 启动工作流，返回第一阶段指令 |
+| `meta_step` | 推进 - 完成当前任务后进入下一阶段 |
 
-1. 设计先行：在 `design/` 文件夹，共十章节，每个章节新增一个需求/规则，拆分为一个或多个工具；
-2. 每章节对应一个 `.py` 文件（位于 `agents/` 文件夹），均可独立运行，增量式的实现上述一个或多个工具，并配有验证问题。
+## 项目结构
 
-| 章节 | 核心机制 | 增量点 |
-|:---:|:---|:---|
-| 01 | 核心循环 + 基础文件工具 | 最小可运行 Agent |
-| 02 | 工具调度矩阵 + 路径沙箱 | 安全执行基础操作 |
-| 03 | ToDo 规划工具 | 引导 Agent 先规划再行动 |
-| 04 | `task` 子代理（上下文隔离） | 隔离子任务不被主流程干扰 |
-| 05 | `load_skill` 渐进式技能 | 按需加载 skills/ 中的提示 |
-| 06 | 三级上下文压缩 | 微压缩、自动压缩、手动压缩 |
-| 07 | `background_run` 后台任务 | 耗时命令并行执行 |
-| 08 | 持久化队友 + 异步邮箱通信 | 多 Agent 协作基础 |
-| 09 | 自主智能体 + 任务看板轮询 | 队友自动认领任务 |
-| 10 | Git Worktree 任务隔离 | 每个任务独立工作树，并行不冲突 |
-
-> 完整验证问题请参考 `design/01-10 完整需求文档.md`
-
-> 此处感谢[learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 项目提供优秀的设计思路、实现案例与教学迭代方式
-
-## 📁 项目结构
-
-```text
+```
 .
-├── agents/                 # 10 章渐进式脚本（01 至 10）
-│ ├── 01-agent_loop.py
-│ ├── ...
-│ └── 10-agent_loop.py      # 最终完整版（全功能 Harness）
-├── design/                 # 10 章设计文档
-├── skills/                 # 可选技能目录（SKILL.md）
-├── ready-to-go-withUI/     # 🎯 预期良好实践一：带 UI 的案例（待完善）
-│ ├── agent_loop.py         # 适配热重载、可编辑的 工具矩阵
-│ └── web_ui.py             # 对话界面 + DIY 工具栏
-├── .env.example
-├── requirements.txt
-├── README_CN.md
-└── README_EN.md
+├── ready-to-use-withUI/        # 源代码
+│   ├── agent_loop.py           # 核心 Agent 循环
+│   ├── meta_dispatcher.py      # 元操作总管家
+│   ├── process_definition.py   # 流程定义
+│   ├── tool_matrix.py          # 工具矩阵
+│   └── web_ui.py               # Web 界面
+├── design/                     # 设计文档
+│   ├── meta_operation_architecture.md
+│   ├── meta_operation_design.md
+│   ├── tool_matrix_layer_architecture.md
+│   └── tool_matrix_layer_design.md
+├── AGENTS.md                   # Agent 配置说明
+├── NETWORK_GUIDE.md            # 网络配置指南
+├── README.md                   # 项目入口
+├── README_CN.md                # 中文说明
+└── README_EN.md                # English README
 ```
 
-## 🚀 快速开始
+## 快速开始
 
-### 1. 环境要求
+### 环境要求
 
 - Python 3.10+
-- Git（第 10 章需要 worktree 功能）
-- 支持 OpenAI API 格式的模型服务（GLM / DeepSeek / Qwen 等）
+- 支持 OpenAI API 格式的模型服务
 
-### 2. 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. 配置环境变量
+### 安装依赖
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入 LLM_API_BASE, LLM_API_KEY, LLM_MODEL
+pip install nicegui openai prompt-toolkit pyyaml requests httpx python-dotenv
 ```
 
-或，请直接在环境变量中新增以上三个变量，简单易行。
-
-### 4. 运行某一章脚本
+### 配置环境变量
 
 ```bash
-python agents/10-agent_loop.py   # 运行最终完整版
+# 必需
+export LLM_API_BASE="your_api_endpoint"
+export LLM_API_KEY="your_api_key"
+export LLM_MODEL="your_model_name"
 ```
 
-然后在提示符下输入自然语言任务，Agent 会自动调用相应工具。
+### 运行
 
-## ✨ 预期良好实践（待持续完善）
+**CLI 模式：**
 
-### 实践一：界面 UI 版（DIY 工具栏）
+```bash
+python ready-to-use-withUI/agent_loop.py
+```
 
-位于 `ready-to-go-withUI/` 文件夹。  
-运行 `web_ui.py` 即可打开一个 Web 对话界面，目前能对话 Agent ，使用既有 01-10 过程中所开发工具。
+**Web UI 模式（推荐）：**
 
-*未来*：你可以在界面中、或界面特定区域，用自然语言描述、定制想要的工具，Agent 会：
+```bash
+python ready-to-use-withUI/web_ui.py
+# 访问 http://localhost:8080
+```
 
-- 完善并实现该功能  
-- 自动验证功能正确性  
-- 将该功能作为**个人特定工具**插入 Harness 的工具矩阵，并立即启用  
+## Web UI 功能
 
-> 例如：*“创建一个工具，能够查询当前天气”* → Agent 自动写出函数、注册到工具矩阵、热重载生效。
+- 实时流式输出
+- 工具调用可视化
+- 深色模式切换
+- 会话持久化
+- 工具 DIY 区域：启用/禁用内置工具，创建自定义工具
+- 队友活动面板：多 Agent 协作消息展示
 
-当前已实现基础部分理念，但仍待继续完善。
+## 流程类型
 
-### 实践二：扩展插件版（插件市场）
+| 流程 | 阶段 | 适用场景 |
+|------|------|----------|
+| code_development | ARCH → REQ → DESIGN → EXEC → VERIFY → DONE | 代码开发 |
+| test_evaluation | PLAN → DESIGN → EXEC → REPORT → DONE | 测试评估 |
+| feature_design | ANALYZE → DESIGN → REVIEW → DONE | 功能设计 |
+| engineering | CONFIG → DEPLOY → VERIFY → DONE | 工程部署 |
+| documentation | PLAN → WRITE → REVIEW → DONE | 文档编写 |
+| general_qa | UNDERSTAND → ANSWER → DONE | 通用问答 |
 
-**规划中**：支持通过插件市场远程获取或上传个人工具。
+## 工具一览
 
-- 通用 Harness 作为底座  
-- 插件包遵循标准接口（函数签名、schema 定义）  
-- 一键安装 / 发布到私有或公共市场
+| 分类 | 工具 | 说明 |
+|------|------|------|
+| 基础 | `read_file`, `write_file`, `edit_file`, `bash` | 文件与命令操作 |
+| 规划 | `todo` | 待办列表管理 |
+| 子代理 | `task` | 上下文隔离的子任务 |
+| 技能 | `load_skill` | 按需加载技能 |
+| 压缩 | `compact` | 上下文压缩 |
+| 后台 | `background_run`, `check_background` | 并行任务执行 |
+| 团队 | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox` | 多 Agent 协作 |
+| 任务 | `task_create`, `task_list`, `task_update` | 任务板管理 |
+| 工作树 | `worktree_create`, `worktree_run` | Git worktree 管理 |
 
-让 Personal Harness 成为一个**可生长的智能体操作系统**。
+## 权限矩阵
 
----
+不同流程拥有不同的工具访问权限：
 
-## 🧰 当前可用工具一览（最终版 10-agent_loop.py ）
+| 流程 | 文件工具 | 任务工具 | 团队工具 | 工作流工具 |
+|------|:--------:|:--------:|:--------:|:----------:|
+| CODE_DEV | ✅ | ✅ | ✅ | ✅ |
+| TEST_EVAL | ✅ | ✅ | ❌ | ❌ |
+| FEATURE_DESIGN | ✅ | ❌ | ❌ | ❌ |
+| ENGINEERING | ✅ | ✅ | ✅ | ❌ |
+| DOC_WRITING | ✅ | ❌ | ❌ | ❌ |
+| GENERAL | ✅ | ❌ | ❌ | ❌ |
 
-| 分类 | 工具名 | 说明 |
-|:---|:---|:---|
-| 基础 | `read_file`, `write_file`, `edit_file`, `bash` | 沙箱化文件与命令 |
-| 规划 | `todo` | 内部待办列表 |
-| 子代理 | `task` | 一次性隔离子任务 |
-| 技能 | `load_skill` | 按需加载 `skills/` 下的技能 |
-| 压缩 | `compact` | 手动触发上下文压缩 |
-| 后台 | `background_run`, `check_background` | 并行运行耗时命令 |
-| 团队 | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox`, `broadcast` | 持久化队友 + 邮箱通信 |
-| 协议 | `shutdown_request`, `plan_approval` | 队友关机与计划审批 |
-| 任务隔离 | `task_create`, `task_list`, `task_get`, `task_update`, `task_bind_worktree` | 任务板管理 |
-| 工作树 | `worktree_create`, `worktree_list`, `worktree_run`, … | Git worktree 生命周期 |
+## 运行时数据
 
----
+所有运行时数据存储在以下目录，可安全删除：
 
-## 📌 注意事项
+- `.transcripts/` - 对话压缩记录
+- `.tasks/` - 任务板数据
+- `.worktrees/` - 工作树状态
+- `.team/` - 团队配置
+- `.tools/` - 自定义工具
 
-- 最终版 10-agent_loop.py 要求当前目录是一个 **Git 仓库**，否则 worktree 工具不可用。  
-- 队友线程基于 `threading`，轻量无额外依赖。  
-- 所有运行时数据保存在 `.transcripts/`（对话压缩）、`.tasks/`（任务板）、`.worktrees/`（工作树）、`.team/`（团队配置）、`.tools/`（个人定制工具），均可安全删除。  
-- 环境变量必须正确配置。
+## 网络配置
 
----
+如遇网络超时，请参考 `NETWORK_GUIDE.md` 配置代理或调整超时设置。
 
-## 📄 许可证
+## 许可证
 
-MIT 许可证，自由使用、修改和分发。
+MIT License
 
----
+## 致谢
 
-## 🙏 致谢
-
-- [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 提供优秀的设计思路与教学迭代方式。  
-- GLM / DeepSeek / Qwen 等开源模型社区。
+- [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 提供优秀的设计思路
+- GLM / DeepSeek / Qwen 等开源模型社区
