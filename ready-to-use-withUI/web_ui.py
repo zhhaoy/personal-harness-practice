@@ -42,8 +42,11 @@ STORAGE_KEY = "pdm_chat_history"
 CURRENT_ASSISTANT_MSG_INDEX = -1
 timer_handle = None
 
+# Todo 状态（独立于消息列表）
+todo_items: list = []                   # [{"id": "1", "text": "...", "status": "pending|in_progress|completed"}]
+
 # 防抖控制：避免频繁刷新
-_pending_refresh = {"chat": False, "tool": False, "teammate": False}
+_pending_refresh = {"chat": False, "teammate": False, "todo": False, "tool_calls": False}
 _refresh_lock = threading.Lock()
 
 # ---------- 心跳线程 ----------
@@ -70,29 +73,41 @@ def do_refresh(refresh_type: str):
     try:
         if refresh_type == "chat":
             ui_chat.refresh()
-        elif refresh_type == "tool":
-            tool_panel.refresh()
         elif refresh_type == "teammate":
             teammate_panel.refresh()
+        elif refresh_type == "todo":
+            todo_panel.refresh()
+        elif refresh_type == "tool_calls":
+            tool_calls_panel.refresh()
     except Exception as e:
         print(f"刷新失败: {e}")
 
 # ---------- 会话持久化 ----------
 def load_history():
-    global messages, tool_calls_history
+    global messages, tool_calls_history, todo_items
     saved = app.storage.user.get(STORAGE_KEY, [])
     if saved:
         messages = saved
         # 从历史消息中重建工具调用列表
         tool_calls_history = [msg for msg in messages if msg.get("role") == "tool"]
+        # 从历史消息中重建 todo 列表（找最后一个 todo 工具调用）
+        for msg in reversed(messages):
+            if msg.get("role") == "tool" and msg.get("tool_name") == "todo":
+                args = msg.get("args", {})
+                todo_data = args.get("items") or args.get("todos")
+                if isinstance(todo_data, list):
+                    todo_items = todo_data
+                break
     else:
         messages = [{
             "role": "assistant",
             "content": "👋 你好！我是 PDM Agent，一名会主动干活的智能体。"
         }]
         tool_calls_history = []
+        todo_items = []
     ui_chat.refresh()
-    tool_panel.refresh()
+    todo_panel.refresh()
+    tool_calls_panel.refresh()
 
 def save_history():
     app.storage.user[STORAGE_KEY] = messages
@@ -139,9 +154,19 @@ def add_tool_call_notification(tool_name: str, args: dict, output: str):
     }
     messages.append(record)
     tool_calls_history.append(record)   # 同步到历史列表
+    
+    # 检测 todo 工具调用，更新独立 todo 状态
+    # 参数名可能是 "items" 或 "todos"
+    global todo_items
+    if tool_name == "todo":
+        todo_data = args.get("items") or args.get("todos")
+        if isinstance(todo_data, list):
+            todo_items = todo_data
+            schedule_refresh("todo", 0.1)
+    
     save_history()
-    schedule_refresh("chat", 0.15)  # 稍长延迟，避免频繁刷新
-    schedule_refresh("tool", 0.15)
+    schedule_refresh("chat", 0.15)
+    schedule_refresh("tool_calls", 0.15)
 
 def refresh_teammate_panel():
     """安全地刷新队友面板"""
@@ -499,18 +524,23 @@ def check_result():
 # ---------- UI 组件 ----------
 @ui.refreshable
 def ui_chat():
-    """渲染聊天消息（仅用户和助手）"""
+    """渲染聊天消息（用户、助手）"""
     with ui.column().classes("w-full max-w-4xl mx-auto p-4"):
         for msg in messages:
             role = msg.get("role")
+            
             if role == "user":
                 with ui.row().classes("justify-end w-full"):
                     with ui.card().classes("bg-blue-100 dark:bg-blue-900 max-w-[80%] break-words overflow-wrap-anywhere").props("flat"):
                         ui.markdown(msg["content"]).classes("text-sm prose prose-sm max-w-none dark:prose-invert")
+                
             elif role == "assistant":
                 with ui.row().classes("justify-start w-full"):
                     with ui.card().classes("bg-gray-100 dark:bg-gray-800 max-w-[80%] break-words overflow-wrap-anywhere").props("flat"):
                         ui.markdown(msg["content"]).classes("text-sm prose prose-sm max-w-none dark:prose-invert")
+            
+            # tool 消息由 tool_calls_panel 统一管理，这里不再显示
+            # teammate 消息由 teammate_panel 统一管理，这里不再显示
 
 @ui.refreshable
 def teammate_panel():
@@ -551,30 +581,106 @@ def teammate_panel():
                             ui.separator().classes("my-1")
 
 @ui.refreshable
-def tool_panel():
-    """工具调用统一面板（位于消息区域底部，紧贴输入框）"""
-    if not tool_calls_history:
-        with ui.expansion(text="🔧 工具调用历史", icon="build").classes("w-full max-w-4xl mx-auto mb-2"):
-            ui.label("暂无工具调用记录").classes("text-xs text-gray-400")
-    else:
-        latest = tool_calls_history[-1]
-        latest_preview = latest.get("output", "").replace('\n', ' ')[:100]
-        if len(latest.get("output", "")) > 100:
-            latest_preview += "..."
-        caption = f"{latest.get('tool_name')} - {latest_preview}" if latest_preview else latest.get('tool_name')
-        with ui.expansion(
-            text=f"🔧 工具调用历史 ({len(tool_calls_history)} 次)",
-            caption=caption,
-            icon="build"
-        ).classes("w-full max-w-4xl mx-auto mb-2").props("dense"):
-            for tc in tool_calls_history:
-                with ui.column().classes("p-2 border-b border-gray-200 dark:border-gray-700"):
-                    ui.markdown(f"**{tc['tool_name']}**").classes("text-sm font-mono")
-                    ui.markdown(f"参数: ```json\n{json.dumps(tc.get('args', {}), ensure_ascii=False, indent=2)[:300]}\n```").classes("text-xs")
-                    output_preview = tc.get('output', '')[:300]
-                    if len(tc.get('output', '')) > 300:
-                        output_preview += "..."
-                    ui.markdown(f"输出: ```\n{output_preview}\n```").classes("text-xs")
+def todo_panel():
+    """独立的待办事项面板 - 带复选框，实时更新"""
+    with ui.card().classes("w-full shadow-sm border-l-4 border-primary"):
+        with ui.row().classes("items-center justify-between w-full"):
+            ui.label("📋 待办事项").classes("text-lg font-bold")
+            if todo_items:
+                done = sum(1 for t in todo_items if t.get("status") == "completed")
+                ui.label(f"({done}/{len(todo_items)} 已完成)").classes("text-sm text-gray-500")
+        
+        if not todo_items:
+            ui.label("暂无待办任务").classes("text-sm text-gray-400 mt-2")
+        else:
+            with ui.column().classes("w-full mt-2 gap-1"):
+                for item in todo_items:
+                    status = item.get("status", "pending")
+                    text = item.get("text", "")
+                    item_id = item.get("id", "?")
+                    
+                    with ui.row().classes("items-center w-full p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800"):
+                        # 状态图标
+                        if status == "completed":
+                            icon = "check_circle"
+                            color = "positive"
+                        elif status == "in_progress":
+                            icon = "radio_button_checked"
+                            color = "warning"
+                        else:
+                            icon = "radio_button_unchecked"
+                            color = "grey"
+                        
+                        ui.icon(icon, color=color).classes("text-lg")
+                        
+                        # 文本（已完成则加删除线）
+                        label_classes = "text-sm ml-2 flex-grow"
+                        if status == "completed":
+                            label_classes += " line-through text-gray-400"
+                        ui.label(text).classes(label_classes)
+                        
+                        # 状态标签
+                        if status == "in_progress":
+                            ui.badge("进行中", color="warning").classes("text-xs")
+
+@ui.refreshable
+def tool_calls_panel():
+    """统一的工具调用面板 - 下拉框显示，不展开时显示最新状态"""
+    # 过滤掉 todo 工具调用（todo 由独立面板管理）
+    display_calls = [tc for tc in tool_calls_history if tc.get("tool_name") != "todo"]
+    
+    with ui.card().classes("w-full max-w-4xl mx-auto mb-2 shadow-sm"):
+        if not display_calls:
+            with ui.expansion(text="🔧 工具调用", icon="terminal").classes("w-full").props("dense"):
+                ui.label("暂无工具调用").classes("text-sm text-gray-400")
+        else:
+            # 不展开时的状态摘要
+            latest = display_calls[-1]
+            latest_tool = latest.get("tool_name", "unknown")
+            latest_output = latest.get("output", "")
+            # 截取输出预览
+            output_preview = latest_output.replace('\n', ' ')[:80]
+            if len(latest_output) > 80:
+                output_preview += "..."
+            
+            with ui.expansion(
+                text=f"🔧 工具调用 ({len(display_calls)} 次)",
+                caption=f"最新: {latest_tool}",
+                icon="terminal"
+            ).classes("w-full").props("dense"):
+                # 工具调用列表（最新的在上方）
+                for tc in reversed(display_calls):
+                    tool_name = tc.get("tool_name", "unknown")
+                    args = tc.get("args", {})
+                    output = tc.get("output", "")
+                    timestamp = tc.get("timestamp", "")
+                    
+                    with ui.card().classes("w-full mb-2 p-2 bg-gray-50 dark:bg-gray-800").props("flat"):
+                        # 工具名和时间
+                        with ui.row().classes("items-center justify-between w-full"):
+                            with ui.row().classes("items-center gap-2"):
+                                ui.icon("play_arrow", color="primary").classes("text-sm")
+                                ui.label(tool_name).classes("text-sm font-mono font-bold")
+                            if timestamp:
+                                try:
+                                    ts = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+                                    ui.label(ts).classes("text-xs text-gray-400")
+                                except:
+                                    pass
+                        
+                        # 参数（如果有且非空）
+                        if args:
+                            args_str = json.dumps(args, ensure_ascii=False, indent=2)
+                            if len(args_str) > 10:  # 只显示有实际内容的参数
+                                with ui.expansion(text="参数", icon="list").classes("w-full mt-1").props("dense"):
+                                    ui.code(args_str[:500] + ("..." if len(args_str) > 500 else "")).classes("text-xs")
+                        
+                        # 输出
+                        output_display = output[:500] if output else "(无输出)"
+                        if len(output) > 500:
+                            output_display += "..."
+                        with ui.expansion(text="输出", icon="output").classes("w-full mt-1").props("dense"):
+                            ui.code(output_display).classes("text-xs")
 
 # ---------- 工具 DIY 面板 ----------
 @ui.refreshable
@@ -632,16 +738,18 @@ def tool_diy_panel():
             ui.button("生成工具", on_click=lambda: create_custom_tool_from_requirement(requirement_input.value)).props("color=positive")
 
 def clear_history():
-    global messages, tool_calls_history, CURRENT_ASSISTANT_MSG_INDEX
+    global messages, tool_calls_history, CURRENT_ASSISTANT_MSG_INDEX, todo_items
     messages = [{
         "role": "assistant",
         "content": "🧹 历史已清空。有什么可以帮你的？"
     }]
     tool_calls_history = []
+    todo_items = []
     CURRENT_ASSISTANT_MSG_INDEX = -1
     save_history()
     ui_chat.refresh()
-    tool_panel.refresh()
+    todo_panel.refresh()
+    tool_calls_panel.refresh()
     teammate_panel.refresh()
     ui.notify("会话已清空", type="info")
 
@@ -745,7 +853,6 @@ def create_ui():
         ui.label("PDM Agent").classes("text-xl font-bold")
         ui.label("Personal Harness").classes("text-sm opacity-80")
         ui.space()
-        # 历史上下文开关
         ui.button(icon="history", on_click=toggle_history).props("flat round").classes("text-white").tooltip("切换历史上下文")
         ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white").tooltip("工具DIY")
         ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white").tooltip("切换深色模式")
@@ -755,9 +862,17 @@ def create_ui():
         ui.label("工具DIY区域").classes("text-xl font-bold mb-4")
         tool_diy_panel()
 
-    with ui.column().classes("w-full items-center"):
+    # 主布局：使用绝对定位让 Todo Panel 固定
+    # Todo Panel（固定在左侧，不随滚动）
+    with ui.card().classes(
+        "fixed left-4 top-20 w-72 h-[calc(100vh-180px)] overflow-y-auto shadow-lg z-50"
+    ):
+        todo_panel()
+    
+    # 中间聊天区（左侧留出空间给 Todo Panel）
+    with ui.column().classes("w-full pl-80 items-center"):
         ui_chat()
-        tool_panel()
+        tool_calls_panel()
         teammate_panel()
 
     with ui.footer().classes("bg-gray-100 dark:bg-gray-900 p-4"):
