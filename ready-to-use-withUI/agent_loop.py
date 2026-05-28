@@ -2153,12 +2153,23 @@ def _make_base_tools():
     registry.register("edit_file", "编辑文件",
         {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]},
         lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]), builtin=True, editable=False)
-    # 待办工具
-    registry.register("todo", "创建或更新任务列表",
+    # 待办工具（支持嵌套任务栈）
+    registry.register("todo", "创建或更新任务列表。注意：如果当前有未完成任务，新列表将作为子任务，不会覆盖父任务！",
         {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object",
             "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
             "required": ["id", "text", "status"]}}}, "required": ["items"]},
         lambda **kw: run_todo(kw["items"]), builtin=True, editable=False)
+    registry.register("todo_complete", "完成任务并自动恢复父任务（子任务全部完成后自动恢复）",
+        {"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "要完成的任务ID，不提供则完成所有进行中的任务"}
+        }},
+        lambda **kw: run_todo_complete(kw.get("task_id")), builtin=True, editable=False)
+    registry.register("todo_restore", "手动恢复父任务列表（放弃当前子任务）",
+        {"type": "object", "properties": {}},
+        lambda **kw: run_todo_restore(), builtin=True, editable=False)
+    registry.register("todo_status", "查看当前任务状态、嵌套层级和完整任务树",
+        {"type": "object", "properties": {}},
+        lambda **kw: run_todo_status(), builtin=True, editable=False)
     # 子代理工具
     registry.register("task", "启动一次性子代理",
         {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]},
@@ -2518,11 +2529,72 @@ def run_edit(path: str, old_text: str, new_text: str) -> Tuple[str, Optional[str
         return "", f"编辑文件失败: {str(e)}"
 
 def run_todo(items: List[Dict]) -> Tuple[str, Optional[str]]:
+    """
+    更新任务列表
+    
+    注意：如果当前有未完成的任务，新任务列表将作为子任务
+    子任务全部完成后会自动恢复父任务列表
+    """
     try:
         result = TODO.update(items)
+        
+        # 如果有嵌套，添加提示
+        if TODO.get_stack_depth() > 0:
+            result += f"\n\n📌 当前为子任务层级 {TODO.get_stack_depth()}，父任务已保存"
+        
         return result, None
     except Exception as e:
         return "", f"更新任务列表失败: {str(e)}"
+
+def run_todo_complete(task_id: str = None) -> Tuple[str, Optional[str]]:
+    """
+    完成任务并自动恢复父任务（如果有）
+    
+    Args:
+        task_id: 要完成的任务ID，不提供则完成所有进行中的任务
+    """
+    try:
+        result = TODO.complete_and_restore(task_id)
+        return result, None
+    except Exception as e:
+        return "", f"完成任务失败: {str(e)}"
+
+def run_todo_restore() -> Tuple[str, Optional[str]]:
+    """
+    手动恢复父任务列表（放弃当前子任务）
+    """
+    try:
+        if not TODO.stack:
+            return "当前没有父任务可恢复", None
+        
+        depth = TODO.get_stack_depth()
+        TODO.pop_from_stack()
+        result = f"✅ 已恢复父任务列表（层级 {depth} → {depth-1}）\n\n"
+        result += TODO.render()
+        return result, None
+    except Exception as e:
+        return "", f"恢复父任务失败: {str(e)}"
+
+def run_todo_status() -> Tuple[str, Optional[str]]:
+    """
+    查看当前任务状态和嵌套层级
+    """
+    try:
+        result = f"当前任务层级: {TODO.get_stack_depth()}\n"
+        result += f"当前任务数: {len(TODO.items)}\n"
+        
+        current = TODO.get_current_task()
+        if current:
+            result += f"正在执行: #{current['id']} - {current['text'][:50]}\n"
+        
+        next_task = TODO.get_next_pending_task()
+        if next_task:
+            result += f"下一个待执行: #{next_task['id']} - {next_task['text'][:50]}\n"
+        
+        result += "\n" + TODO.render_full()
+        return result, None
+    except Exception as e:
+        return "", f"获取状态失败: {str(e)}"
 
 def run_load_skill(name: str) -> Tuple[str, Optional[str]]:
     content = SKILL_LOADER.get_content(name)
@@ -2768,14 +2840,47 @@ _make_base_tools()
 # ========== 工具调度矩阵 (由 registry 动态调用) ==========
 # 注：agent_loop 中使用 registry.get_tools_def() 和 registry.get_handler()
 
-# ========== TodoManager (保留内部待办) ==========
+# ========== TodoManager (支持嵌套任务栈) ==========
 class TodoManager:
+    """
+    待办事项管理器 - 支持嵌套任务栈
+    
+    解决的问题：
+    - 当执行任务3时，如果触发了新的子任务列表，不会覆盖原有任务
+    - 子任务完成后，自动恢复父任务列表
+    - 支持多层级嵌套
+    
+    数据结构：
+    - items: 当前任务列表
+    - stack: 任务栈，保存父任务上下文
+    - 每个栈帧: {
+        "items": 父任务列表,
+        "current_task_id": 触发子任务的父任务ID,
+        "current_task_text": 触发子任务的父任务内容,
+        "created_at": 创建时间
+      }
+    """
+    
     def __init__(self):
         self.items = []
-
-    def update(self, items: list) -> str:
-        if len(items) > 20:
-            raise ValueError("最多允许 20 个任务")
+        self.stack = []  # 任务栈
+        self.max_depth = 5  # 最大嵌套深度
+        self.max_items = 20  # 最大任务数
+    
+    def update(self, items: list, parent_context: dict = None) -> str:
+        """
+        更新任务列表
+        
+        Args:
+            items: 新的任务列表
+            parent_context: 父任务上下文（内部使用）
+        
+        Returns:
+            渲染后的任务列表
+        """
+        if len(items) > self.max_items:
+            raise ValueError(f"最多允许 {self.max_items} 个任务")
+        
         validated = []
         for i, item in enumerate(items):
             text = str(item.get("text", "")).strip()
@@ -2786,19 +2891,223 @@ class TodoManager:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"任务 {item_id}: 无效状态 '{status}'")
             validated.append({"id": item_id, "text": text, "status": status})
+        
+        # 检查是否需要保存当前任务到栈中
+        if self._should_push_to_stack():
+            self._push_to_stack(items=validated)
+        
         self.items = validated
         return self.render()
-
+    
+    def _should_push_to_stack(self) -> bool:
+        """
+        检查是否需要将当前任务压入栈
+        
+        条件：
+        1. 当前有未完成的任务
+        2. 栈深度未超过限制
+        """
+        if not self.items:
+            return False
+        
+        # 检查是否有未完成的任务
+        has_incomplete = any(
+            item["status"] in ("pending", "in_progress") 
+            for item in self.items
+        )
+        
+        if not has_incomplete:
+            return False
+        
+        # 检查栈深度
+        if len(self.stack) >= self.max_depth:
+            return False
+        
+        return True
+    
+    def _push_to_stack(self, items: list = None):
+        """
+        将当前任务上下文压入栈
+        
+        Args:
+            items: 即将设置的新任务列表（用于检测是否是子任务）
+        """
+        if not self.items:
+            return
+        
+        # 找到当前正在执行的任务
+        current_task = None
+        for item in self.items:
+            if item["status"] == "in_progress":
+                current_task = item.copy()
+                break
+        
+        if not current_task:
+            # 如果没有正在执行的任务，找第一个 pending 任务
+            for item in self.items:
+                if item["status"] == "pending":
+                    current_task = item.copy()
+                    break
+        
+        if current_task:
+            # 保存当前任务上下文到栈
+            frame = {
+                "items": [item.copy() for item in self.items],
+                "current_task_id": current_task["id"],
+                "current_task_text": current_task["text"],
+                "created_at": time.time()
+            }
+            self.stack.append(frame)
+    
+    def pop_from_stack(self) -> bool:
+        """
+        从栈中恢复父任务
+        
+        Returns:
+            是否成功恢复
+        """
+        if not self.stack:
+            return False
+        
+        frame = self.stack.pop()
+        self.items = frame["items"]
+        return True
+    
+    def complete_and_restore(self, task_id: str = None) -> str:
+        """
+        完成指定任务，并在所有当前任务完成后尝试恢复父任务
+        
+        Args:
+            task_id: 要完成的任务ID（可选，不提供则完成所有进行中的任务）
+        
+        Returns:
+            操作结果
+        """
+        # 标记任务完成
+        if task_id:
+            for item in self.items:
+                if item["id"] == task_id:
+                    item["status"] = "completed"
+        else:
+            for item in self.items:
+                if item["status"] == "in_progress":
+                    item["status"] = "completed"
+        
+        # 检查当前任务是否全部完成
+        all_completed = all(
+            item["status"] == "completed" 
+            for item in self.items
+        )
+        
+        result = self.render()
+        
+        # 如果全部完成且有父任务，恢复父任务
+        if all_completed and self.stack:
+            frame = self.stack[-1]  # 查看栈顶
+            parent_task_id = frame["current_task_id"]
+            
+            # 恢复父任务列表
+            self.pop_from_stack()
+            
+            # 标记父任务中触发子任务的那个任务为完成
+            for item in self.items:
+                if item["id"] == parent_task_id:
+                    item["status"] = "completed"
+                    break
+            
+            result += f"\n\n✅ 子任务已完成，已恢复父任务列表（任务 #{parent_task_id} 已标记完成）"
+            result += f"\n" + self.render()
+        
+        return result
+    
+    def get_stack_depth(self) -> int:
+        """获取当前栈深度"""
+        return len(self.stack)
+    
+    def get_current_task(self) -> Optional[dict]:
+        """获取当前正在执行的任务"""
+        for item in self.items:
+            if item["status"] == "in_progress":
+                return item.copy()
+        return None
+    
+    def get_next_pending_task(self) -> Optional[dict]:
+        """获取下一个待执行的任务"""
+        for item in self.items:
+            if item["status"] == "pending":
+                return item.copy()
+        return None
+    
     def render(self) -> str:
+        """渲染任务列表"""
         if not self.items:
             return "暂无待办任务。"
+        
         lines = []
+        
+        # 显示栈深度提示
+        if self.stack:
+            indent = "  " * len(self.stack)
+            lines.append(f"{'📌 ' * len(self.stack)}[嵌套层级 {len(self.stack)}]")
+            for i, frame in enumerate(self.stack):
+                lines.append(f"  └─ 父任务 #{frame['current_task_id']}: {frame['current_task_text'][:30]}...")
+            lines.append("")
+        
         for item in self.items:
             marker = {"pending":"[ ]", "in_progress":"[>]", "completed":"[x]"}.get(item["status"], "[?]")
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
+            indent = "  " * len(self.stack) if self.stack else ""
+            lines.append(f"{indent}{marker} #{item['id']}: {item['text']}")
+        
         done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} 任务完成)")
+        total = len(self.items)
+        lines.append(f"\n{indent}({done}/{total} 任务完成)")
+        
+        # 如果全部完成且有父任务，提示可以恢复
+        if done == total and self.stack:
+            lines.append(f"\n💡 所有子任务已完成，可调用 todo_restore 恢复父任务")
+        
         return "\n".join(lines)
+    
+    def render_full(self) -> str:
+        """渲染完整的任务树（包括所有栈中的父任务）"""
+        result_parts = []
+        
+        # 从栈底到栈顶渲染
+        all_frames = self.stack + [{"items": self.items, "current_task_id": None}]
+        
+        for i, frame in enumerate(all_frames):
+            indent = "  " * i
+            items = frame["items"]
+            
+            if i < len(self.stack):
+                result_parts.append(f"{indent}📦 父任务层级 {i+1}:")
+            
+            for item in items:
+                marker = {"pending":"[ ]", "in_progress":"[>]", "completed":"[x]"}.get(item["status"], "[?]")
+                prefix = "└─ " if i < len(all_frames) - 1 else ""
+                result_parts.append(f"{indent}{prefix}{marker} #{item['id']}: {item['text']}")
+            
+            if i < len(all_frames) - 1:
+                result_parts.append("")
+        
+        return "\n".join(result_parts)
+    
+    def clear_stack(self):
+        """清空任务栈"""
+        self.stack = []
+    
+    def get_state(self) -> dict:
+        """获取当前状态（用于持久化）"""
+        return {
+            "items": self.items.copy(),
+            "stack": [frame.copy() for frame in self.stack]
+        }
+    
+    def restore_state(self, state: dict):
+        """恢复状态（从持久化数据）"""
+        self.items = state.get("items", [])
+        self.stack = state.get("stack", [])
+
 
 TODO = TodoManager()
 
@@ -2821,7 +3130,7 @@ Git 仓库根目录: {repo_root_str} (如果为空则不支持 worktree)。创�
 可用工具分类（根据 enable 状态，部分可能被禁用）：
 1. 基础文件操作：read_file, write_file, edit_file, bash
 2. 技能加载：load_skill
-3. 内部待办清单：todo
+3. **待办清单（支持嵌套）**：todo, todo_complete, todo_restore, todo_status
 4. 内部任务：task
 5. 发布任务给队员，采用任务面板 + 隔离工作树方式：task_create, task_list, task_get, task_update, task_bind_worktree, worktree_create, worktree_list, worktree_status, worktree_run, worktree_keep, worktree_remove, worktree_events
 6. 队员管理：spawn_teammate, activate_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, plan_approval
@@ -2886,6 +3195,21 @@ LLM:
 - 每个阶段完成后必须调用 meta_step 推进
 - 底层工具（read_file, write_file 等）只在流程指令建议时调用
 - 确保 workflow 完整执行，不要中途停止
+
+**【重要】嵌套任务栈工作流**：
+当执行某个任务时，如果需要创建子任务列表，系统会自动保存父任务，不会覆盖！
+
+例如：正在执行任务1-5，当执行任务3时需要创建详细的子任务列表：
+1. 调用 todo 创建子任务 [3.1, 3.2, 3.3] 时，系统自动保存父任务 [1-5]
+2. 完成子任务时，调用 todo_complete(task_id="3.1") 标记完成
+3. 所有子任务完成后，系统自动恢复父任务列表，并标记任务3为完成
+4. 继续执行任务4、5...
+
+**待办工具使用**：
+- `todo(items=[...])` - 创建/更新任务列表（自动处理嵌套）
+- `todo_complete(task_id)` - 完成任务，子任务全部完成后自动恢复父任务
+- `todo_restore()` - 手动恢复父任务列表（放弃当前子任务）
+- `todo_status()` - 查看当前任务状态和嵌套层级
 
 **任务隔离工作流**：
 - 当你需要处理一个可能与其他工作冲突的任务时，先为该任务创建一个独立的工作树：worktree_create name=短名称 task_id=<任务ID>

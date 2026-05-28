@@ -107,7 +107,8 @@ class ToolMatrix:
             "workflow_start", "workflow_step", "workflow_status"
         },
         ToolGroup.CONTEXT: {
-            "compact", "load_skill", "todo", "task"
+            "compact", "load_skill", "todo", "task",
+            "todo_complete", "todo_restore", "todo_status"
         },
         ToolGroup.BACKGROUND: {
             "background_run", "check_background"

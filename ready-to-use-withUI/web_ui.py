@@ -215,14 +215,21 @@ def add_tool_call_notification(tool_name: str, args: dict, output: str):
     messages.append(record)
     tool_calls_history.append(record)   # 同步到历史列表
     
-    # 检测 todo 工具调用，更新独立 todo 状态
-    # 参数名可能是 "items" 或 "todos"
+    # 检测 todo 相关工具调用，更新独立 todo 状态
     global todo_items
     if tool_name == "todo":
         todo_data = args.get("items") or args.get("todos")
         if isinstance(todo_data, list):
             todo_items = todo_data
             schedule_refresh("todo", 0.1)
+    elif tool_name in ("todo_complete", "todo_restore", "todo_status"):
+        # 从 agent_loop.TODO 同步状态
+        try:
+            from agent_loop import TODO
+            todo_items = TODO.items.copy()
+            schedule_refresh("todo", 0.1)
+        except Exception:
+            pass
     
     save_history()
     schedule_refresh("chat", 0.15)
@@ -642,19 +649,36 @@ def teammate_panel():
 
 @ui.refreshable
 def todo_panel():
-    """独立的待办事项面板 - 带复选框，实时更新"""
+    """独立的待办事项面板 - 支持嵌套任务栈显示"""
+    # 尝试从 agent_loop.TODO 获取状态
+    try:
+        from agent_loop import TODO
+        stack_depth = TODO.get_stack_depth()
+        current_items = TODO.items
+    except Exception:
+        stack_depth = 0
+        current_items = todo_items
+    
     with ui.card().classes("w-full shadow-sm border-l-4 border-primary"):
         with ui.row().classes("items-center justify-between w-full"):
             ui.label("📋 待办事项").classes("text-lg font-bold")
-            if todo_items:
-                done = sum(1 for t in todo_items if t.get("status") == "completed")
-                ui.label(f"({done}/{len(todo_items)} 已完成)").classes("text-sm text-gray-500")
+            if current_items:
+                done = sum(1 for t in current_items if t.get("status") == "completed")
+                ui.label(f"({done}/{len(current_items)} 已完成)").classes("text-sm text-gray-500")
         
-        if not todo_items:
+        # 显示嵌套层级提示
+        if stack_depth > 0:
+            with ui.row().classes("items-center gap-1 mt-1"):
+                ui.icon("layers", color="primary").classes("text-sm")
+                ui.label(f"嵌套层级 {stack_depth}").classes("text-xs text-primary")
+                if stack_depth > 1:
+                    ui.label(f"({stack_depth} 层父任务)").classes("text-xs text-gray-400")
+        
+        if not current_items:
             ui.label("暂无待办任务").classes("text-sm text-gray-400 mt-2")
         else:
             with ui.column().classes("w-full mt-2 gap-1"):
-                for item in todo_items:
+                for item in current_items:
                     status = item.get("status", "pending")
                     text = item.get("text", "")
                     item_id = item.get("id", "?")
@@ -671,13 +695,15 @@ def todo_panel():
                             icon = "radio_button_unchecked"
                             color = "grey"
                         
+                        # 嵌套层级缩进
+                        indent = "  " * stack_depth if stack_depth else ""
                         ui.icon(icon, color=color).classes("text-lg")
                         
                         # 文本（已完成则加删除线）
                         label_classes = "text-sm ml-2 flex-grow"
                         if status == "completed":
                             label_classes += " line-through text-gray-400"
-                        ui.label(text).classes(label_classes)
+                        ui.label(f"{indent}{text}").classes(label_classes)
                         
                         # 状态标签
                         if status == "in_progress":
