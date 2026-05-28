@@ -1,6 +1,15 @@
 # Personal Harness
 
-**个人智能体基础设施框架**
+**个人智能体基础设施框架** - 一个支持项目管理、意图追踪、团队协作的 AI Agent 运行底座。
+
+## 核心特性
+
+- 🎯 **意图管理** - 确保 LLM 准确理解并遵循用户的最终目的
+- 📁 **项目隔离** - 每个项目独立的工作目录、历史记录和任务列表
+- 🔄 **智能工作流** - 元操作总管家驱动的流程化执行
+- 🌳 **Worktree 支持** - Git worktree 任务隔离，支持代码合并与保留
+- 👥 **团队协作** - 多 Agent 协作，消息互通
+- 🛠️ **工具矩阵** - 40+ 工具，分层权限管理
 
 ## 简介
 
@@ -15,26 +24,127 @@
 - 上下文隔离
 - 团队协作
 - 任务隔离
+- 意图管理
+- 项目管理
 - ...
 
 你要做的，就是不断完善这个底座，不断添加工具，让智能体不断成长、不断进化。
 
-## 核心概念
+## 快速开始
 
-### Harness（智能体框架）
+### 环境要求
 
-Agent 运行除了底层依赖（LLM API、计算环境），还需要一层**框架**来连接 Agent 与底层依赖。这层框架称为 **Harness**。
+- Python 3.10+
+- OpenAI API 兼容的模型服务
 
-- **通用层工具**：跨平台通用的核心能力，如文件读写、上下文压缩、技能加载、任务发布、团队协作等
-- **特定应用层工具**：开发者按需挂载的个人工具或插件
+### 安装依赖
 
-> 本项目的核心LLM循环 agent_loop.py ，是依据 “design/01-10 完整需求文档.md” 一步一步开发、扩展而来，“agents/”中的每一个 agent_loop.py ，与 “design/01-10 完整需求文档.md” 中的对应章节严格对应，可以逐个章节运行对应的 agent_loop.py。
+```bash
+pip install nicegui openai prompt-toolkit pyyaml requests httpx python-dotenv
+```
 
-> 同时本项目贯彻前述“一切均可工具化”的理念，在“10-agent_loop.py”基础上再次扩展工具集，新增“流程工具”这种元操作工具集，并重新进行层级分划，最终形成下述架构形态。
+### 配置环境变量
 
-### 工具矩阵架构
+```bash
+# 必需
+export LLM_API_BASE="your_api_endpoint"
+export LLM_API_KEY="your_api_key"
+export LLM_MODEL="your_model_name"
+```
 
-本项目采用**分层工具矩阵架构**，以元操作总管家为核心，通过流程驱动的方式管理工作流。
+### 运行
+
+**Web UI 模式（推荐）：**
+
+```bash
+python ready-to-use-withUI/web_ui.py
+# 访问 http://localhost:8080
+```
+
+**CLI 模式：**
+
+```bash
+python ready-to-use-withUI/agent_loop.py
+```
+
+## 主要功能
+
+### 1. 项目管理
+
+每个项目拥有独立的工作空间，切换项目时自动加载对应的历史记录和任务列表。
+
+```
+项目目录/
+├── .pdm/                 # 项目专属数据
+│   ├── chat_history.json # 对话历史
+│   ├── tool_calls.json   # 工具调用记录
+│   ├── todo.json         # 待办事项
+│   ├── intent.json       # 意图记录
+│   └── decisions.json    # 决策记录
+└── .worktrees/          # 工作树目录
+```
+
+**Web UI 操作**：
+- 点击顶部项目名称打开项目管理对话框
+- 选择现有项目或创建新项目
+- 项目切换后自动加载历史记录
+
+### 2. 意图管理
+
+在执行任何设计和操作前，系统会引导 LLM 明确用户的最终目的：
+
+| 工具 | 用途 |
+|------|------|
+| `register_intent` | 注册用户主要目标、次要目标和约束条件 |
+| `clarify_intent` | 当不确定用户意图时，请求用户澄清 |
+| `verify_action` | 验证操作是否符合用户初衷，检测意图偏移 |
+| `track_decision` | 记录重要设计决策，便于回溯 |
+| `get_intent_status` | 查询当前意图状态 |
+
+**工作流程**：
+1. `meta_dispatch` 识别范式，低置信度时进入意图澄清阶段
+2. LLM 调用 `register_intent` 注册用户意图
+3. 执行关键操作前调用 `verify_action` 验证
+4. 做出重要决策时调用 `track_decision` 记录
+
+### 3. Worktree 管理
+
+工作树与项目绑定，支持 Git Worktree 和 Fallback 两种模式。
+
+**文件操作工具**：
+
+| 工具 | 用途 |
+|------|------|
+| `worktree_list_files` | 列出工作树中的文件 |
+| `worktree_read_file` | 读取工作树中的文件内容 |
+| `worktree_copy_files` | 复制文件到主项目目录 |
+| `worktree_sync` | 合并代码到主分支（不删除工作树） |
+
+**代码保留方式**：
+
+```python
+# 推荐：合并后删除
+worktree_remove(name="xxx", merge_to_main=True)
+
+# 中途同步
+worktree_sync(name="xxx")
+
+# 仅删除工作树，保留分支
+worktree_remove(name="xxx")
+```
+
+### 4. 流程类型
+
+| 流程 | 阶段 | 适用场景 |
+|------|------|----------|
+| code_development | ARCH → REQ → DESIGN → EXEC → VERIFY → DONE | 代码开发 |
+| test_evaluation | PLAN → DESIGN → EXEC → REPORT → DONE | 测试评估 |
+| feature_design | ANALYZE → DESIGN → REVIEW → DONE | 功能设计 |
+| engineering | CONFIG → DEPLOY → VERIFY → DONE | 工程部署 |
+| documentation | PLAN → WRITE → REVIEW → DONE | 文档编写 |
+| general_qa | UNDERSTAND → ANSWER → DONE | 通用问答 |
+
+## 架构
 
 ```
 用户层（唯一入口）
@@ -43,11 +153,13 @@ Agent 运行除了底层依赖（LLM API、计算环境），还需要一层**�
   meta_dispatch（总管家）
        │
        │ 识别范式，创建 session
+       │ 意图澄清（低置信度时）
        │ 返回第一阶段指令
        ▼
   Workflow Execution
        │
        │ LLM 调用具体工具
+       │ 意图验证（关键操作时）
        │ meta_step 推进到下一阶段
        ▼
   Process Layer（流程层）
@@ -57,8 +169,8 @@ Agent 运行除了底层依赖（LLM API、计算环境），还需要一层**�
        ▼
   Tool Matrix Layer（工具矩阵层）
        │
-       │ 文件工具 | 任务工具 | 团队工具 | 工作流工具
-       │ 30+ 工具，用户不可见，仅被流程调用
+       │ 文件 | 任务 | 团队 | 工作流 | 意图
+       │ 40+ 工具，分层权限管理
        ▼
 ```
 
@@ -78,77 +190,19 @@ Agent 运行除了底层依赖（LLM API、计算环境），还需要一层**�
 ├── ready-to-use-withUI/        # 源代码
 │   ├── agent_loop.py           # 核心 Agent 循环
 │   ├── meta_dispatcher.py      # 元操作总管家
-│   ├── process_definition.py   # 流程定义
 │   ├── tool_matrix.py          # 工具矩阵
+│   ├── process_definition.py   # 流程定义
+│   ├── intent_tools.py         # 意图管理工具
+│   ├── project_manager.py      # 项目管理器
 │   └── web_ui.py               # Web 界面
-├── design/                     # 设计文档
-│   ├── meta_operation_architecture.md
-│   ├── meta_operation_design.md
-│   ├── tool_matrix_layer_architecture.md
-│   └── tool_matrix_layer_design.md
+├── projects.json               # 项目注册表
 ├── AGENTS.md                   # Agent 配置说明
 ├── NETWORK_GUIDE.md            # 网络配置指南
 ├── README.md                   # 项目入口
 ├── README_CN.md                # 中文说明
 └── README_EN.md                # English README
 ```
-
-## 快速开始
-
-### 环境要求
-
-- Python 3.10+
-- 支持 OpenAI API 格式的模型服务
-
-### 安装依赖
-
-```bash
-pip install nicegui openai prompt-toolkit pyyaml requests httpx python-dotenv
-```
-
-### 配置环境变量
-
-```bash
-# 必需
-export LLM_API_BASE="your_api_endpoint"
-export LLM_API_KEY="your_api_key"
-export LLM_MODEL="your_model_name"
-```
-
-### 运行
-
-**CLI 模式：**
-
-```bash
-python ready-to-use-withUI/agent_loop.py
-```
-
-**Web UI 模式（推荐）：**
-
-```bash
-python ready-to-use-withUI/web_ui.py
-# 访问 http://localhost:8080
-```
-
-## Web UI 功能
-
-- 实时流式输出
-- 工具调用可视化
-- 深色模式切换
-- 会话持久化
-- 工具 DIY 区域：启用/禁用内置工具，创建自定义工具
-- 队友活动面板：多 Agent 协作消息展示
-
-## 流程类型
-
-| 流程 | 阶段 | 适用场景 |
-|------|------|----------|
-| code_development | ARCH → REQ → DESIGN → EXEC → VERIFY → DONE | 代码开发 |
-| test_evaluation | PLAN → DESIGN → EXEC → REPORT → DONE | 测试评估 |
-| feature_design | ANALYZE → DESIGN → REVIEW → DONE | 功能设计 |
-| engineering | CONFIG → DEPLOY → VERIFY → DONE | 工程部署 |
-| documentation | PLAN → WRITE → REVIEW → DONE | 文档编写 |
-| general_qa | UNDERSTAND → ANSWER → DONE | 通用问答 |
+> `design/` 与 `agents/` 两个目录，是搭建`agent_loop`主智能体循环的学习路径和过程，详见 `design/` 中需求所述，每章节均可独立运行对应的智能体并作验证。
 
 ## 工具一览
 
@@ -162,30 +216,32 @@ python ready-to-use-withUI/web_ui.py
 | 后台 | `background_run`, `check_background` | 并行任务执行 |
 | 团队 | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox` | 多 Agent 协作 |
 | 任务 | `task_create`, `task_list`, `task_update` | 任务板管理 |
-| 工作树 | `worktree_create`, `worktree_run` | Git worktree 管理 |
+| 工作树 | `worktree_create`, `worktree_run`, `worktree_list_files`, `worktree_copy_files` | Git worktree 管理 |
+| 意图 | `register_intent`, `clarify_intent`, `verify_action`, `track_decision` | 意图管理 |
 
 ## 权限矩阵
 
 不同流程拥有不同的工具访问权限：
 
-| 流程 | 文件工具 | 任务工具 | 团队工具 | 工作流工具 |
-|------|:--------:|:--------:|:--------:|:----------:|
-| CODE_DEV | ✅ | ✅ | ✅ | ✅ |
-| TEST_EVAL | ✅ | ✅ | ❌ | ❌ |
-| FEATURE_DESIGN | ✅ | ❌ | ❌ | ❌ |
-| ENGINEERING | ✅ | ✅ | ✅ | ❌ |
-| DOC_WRITING | ✅ | ❌ | ❌ | ❌ |
-| GENERAL | ✅ | ❌ | ❌ | ❌ |
+| 流程 | 文件 | 任务 | 团队 | 工作流 | 意图 |
+|------|:----:|:----:|:----:|:------:|:----:|
+| CODE_DEV | ✅ | ✅ | ✅ | ✅ | ✅ |
+| TEST_EVAL | ✅ | ✅ | ❌ | ❌ | ✅ |
+| FEATURE_DESIGN | ✅ | ❌ | ❌ | ❌ | ✅ |
+| ENGINEERING | ✅ | ✅ | ✅ | ❌ | ✅ |
+| DOC_WRITING | ✅ | ❌ | ❌ | ❌ | ✅ |
+| GENERAL | ✅ | ❌ | ❌ | ❌ | ✅ |
 
 ## 运行时数据
 
 所有运行时数据存储在以下目录，可安全删除：
 
-- `.transcripts/` - 对话压缩记录
+- `<project>/.pdm/` - 项目专属数据（对话、任务、意图）
+- `<project>/.worktrees/` - 工作树状态
 - `.tasks/` - 任务板数据
-- `.worktrees/` - 工作树状态
 - `.team/` - 团队配置
 - `.tools/` - 自定义工具
+- `.transcripts/` - 对话压缩记录
 
 ## 网络配置
 

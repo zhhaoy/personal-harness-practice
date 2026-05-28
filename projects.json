@@ -1,0 +1,19 @@
+{
+  "projects": {    
+    "D:\\demo": {
+      "name": "demo",
+      "path": "D:\\demo",
+      "description": "",
+      "created_at": "2026-05-29T00:34:07.149460",
+      "last_accessed": "2026-05-29T01:38:45.392189"
+    },
+    "D:\\demo2": {
+      "name": "demo2",
+      "path": "D:\\demo2",
+      "description": "",
+      "created_at": "2026-05-29T01:39:12.123843",
+      "last_accessed": "2026-05-29T01:45:02.594406"
+    }
+  },
+  "last_project_path": "D:\\demo2"
+}

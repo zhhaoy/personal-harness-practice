@@ -391,6 +391,27 @@ class PhaseInstructionGenerator:
                 quality_gate="回答完成"
             ),
             
+            # 意图管理阶段
+            "INTENT_CLARIFICATION": PhaseInstruction(
+                phase="INTENT_CLARIFICATION",
+                description="意图澄清阶段",
+                objective="明确用户的最终目的，确保后续执行方向正确",
+                tools_to_call=[
+                    ToolCallInstruction("register_intent", {
+                        "session_id": "<session_id>",
+                        "primary_goals": ["<主要目标>"],
+                        "secondary_goals": ["<次要目标>"],
+                        "constraints": ["<约束条件>"]
+                    }, "【必须】注册用户的最终目的", True),
+                    ToolCallInstruction("clarify_intent", {
+                        "session_id": "<session_id>",
+                        "question": "<需要澄清的问题>"
+                    }, "当不确定用户意图时，向用户提问", False),
+                ],
+                expected_output="用户的明确目标、次要目标和约束条件",
+                quality_gate="用户意图已确认"
+            ),
+            
             # 通用阶段
             "DONE": PhaseInstruction(
                 phase="DONE",
@@ -597,7 +618,64 @@ class MetaDispatcherCore:
                 context={"query": query, **context}
             )
             
-            # 5. 生成第一阶段指令
+            # 5. 检查置信度，决定是否需要意图澄清
+            CONFIDENCE_THRESHOLD = 0.6
+            needs_intent_clarification = confidence < CONFIDENCE_THRESHOLD
+            
+            if needs_intent_clarification:
+                # 低置信度：返回意图澄清引导
+                phase_instruction = PhaseInstruction(
+                    phase="INTENT_CLARIFICATION",
+                    description="意图澄清阶段",
+                    objective="明确用户的最终目的，消除歧义",
+                    tools_to_call=[
+                        ToolCallInstruction("clarify_intent", {
+                            "session_id": session_id,
+                            "question": "<需要澄清的问题>"
+                        }, "当不确定用户意图时，生成澄清问题", False),
+                        ToolCallInstruction("register_intent", {
+                            "session_id": session_id,
+                            "primary_goals": ["<主要目标>"]
+                        }, "【必须】注册用户最终目的", True),
+                    ],
+                    expected_output="用户的明确目标和约束条件",
+                    quality_gate="用户意图已确认并注册"
+                )
+                
+                output = f"""[意图澄清引导]
+
+范式识别置信度较低 ({confidence:.0%})，建议先明确用户意图。
+
+{reasoning}
+
+【推荐操作】
+1. 先调用 register_intent 注册您理解的用户目标
+2. 如果不确定，调用 clarify_intent 向用户提问
+3. 确认意图后再执行具体任务
+
+会话ID: {session_id}
+识别的范式: {paradigm.value}
+
+提示：准确的意图注册能确保后续所有操作都符合用户初衷。
+"""
+                return DispatchResult(
+                    success=True,
+                    paradigm=paradigm,
+                    process_name=process.name,
+                    session_id=session_id,
+                    current_phase="INTENT_CLARIFICATION",
+                    phase_instruction=phase_instruction,
+                    phases_completed=[],
+                    phases_pending=["INTENT_CLARIFICATION"] + process.get_all_phases(),
+                    output=output,
+                    artifacts={},
+                    tool_calls_history=[],
+                    can_continue=True,
+                    is_done=False,
+                    next_action="请先调用 register_intent 注册用户意图，然后调用 meta_step 推进到下一阶段"
+                )
+            
+            # 6. 生成第一阶段指令（高置信度路径）
             phase_def = process.get_phase(initial_phase)
             allowed_tools = self.tool_matrix.get_allowed_tools(paradigm.value) if self.tool_matrix else []
             
@@ -609,8 +687,24 @@ class MetaDispatcherCore:
                 allowed_tools=allowed_tools
             )
             
-            # 6. 构建输出
+            # 7. 在指令中添加意图注册提示
+            intent_hint = """
+【重要提示】在开始执行前，请先调用 register_intent 注册用户意图：
+- primary_goals: 用户的主要目标
+- constraints: 用户的约束条件（如有）
+
+这能确保后续操作符合用户初衷，避免做无用功。
+"""
+            phase_instruction.tools_to_call.insert(0, ToolCallInstruction(
+                "register_intent",
+                {"session_id": session_id, "primary_goals": ["<用户主要目标>"]},
+                "【推荐】注册用户意图，确保执行方向正确",
+                False  # 非必须，但强烈推荐
+            ))
+            
+            # 8. 构建输出
             output = self._format_phase_output(phase_instruction, reasoning, session_id)
+            output = intent_hint + output
             
             return DispatchResult(
                 success=True,

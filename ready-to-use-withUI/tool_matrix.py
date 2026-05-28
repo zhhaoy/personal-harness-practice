@@ -21,6 +21,7 @@ class ToolGroup(Enum):
     WORKFLOW = "workflow"
     CONTEXT = "context"
     BACKGROUND = "background"
+    INTENT = "intent"
 
 
 @dataclass
@@ -44,14 +45,16 @@ class PermissionMatrix:
         if not self.permissions:
             self.permissions = {
                 "CODE_DEV": {ToolGroup.FILE, ToolGroup.TASK, ToolGroup.TEAM, 
-                            ToolGroup.WORKFLOW, ToolGroup.CONTEXT, ToolGroup.BACKGROUND},
-                "TEST_EVAL": {ToolGroup.FILE, ToolGroup.TASK, ToolGroup.CONTEXT, ToolGroup.BACKGROUND},
-                "FEATURE_DESIGN": {ToolGroup.FILE, ToolGroup.CONTEXT},
+                            ToolGroup.WORKFLOW, ToolGroup.CONTEXT, ToolGroup.BACKGROUND,
+                            ToolGroup.INTENT},
+                "TEST_EVAL": {ToolGroup.FILE, ToolGroup.TASK, ToolGroup.CONTEXT, ToolGroup.BACKGROUND,
+                             ToolGroup.INTENT},
+                "FEATURE_DESIGN": {ToolGroup.FILE, ToolGroup.CONTEXT, ToolGroup.INTENT},
                 "ENGINEERING": {ToolGroup.FILE, ToolGroup.TASK, ToolGroup.TEAM, 
-                               ToolGroup.CONTEXT, ToolGroup.BACKGROUND},
-                "DOC_WRITING": {ToolGroup.FILE, ToolGroup.CONTEXT},
-                "DATA_ANALYSIS": {ToolGroup.FILE, ToolGroup.CONTEXT, ToolGroup.BACKGROUND},
-                "GENERAL": {ToolGroup.FILE, ToolGroup.CONTEXT},
+                               ToolGroup.CONTEXT, ToolGroup.BACKGROUND, ToolGroup.INTENT},
+                "DOC_WRITING": {ToolGroup.FILE, ToolGroup.CONTEXT, ToolGroup.INTENT},
+                "DATA_ANALYSIS": {ToolGroup.FILE, ToolGroup.CONTEXT, ToolGroup.BACKGROUND, ToolGroup.INTENT},
+                "GENERAL": {ToolGroup.FILE, ToolGroup.CONTEXT, ToolGroup.INTENT},
             }
     
     def has_permission(self, paradigm: str, tool_group: ToolGroup) -> bool:
@@ -92,7 +95,8 @@ class ToolMatrix:
         ToolGroup.TASK: {
             "task_create", "task_list", "task_get", "task_update", "task_bind_worktree",
             "worktree_create", "worktree_list", "worktree_status", "worktree_run",
-            "worktree_keep", "worktree_remove", "worktree_events"
+            "worktree_keep", "worktree_remove", "worktree_events",
+            "worktree_sync", "worktree_list_files", "worktree_copy_files", "worktree_read_file"
         },
         ToolGroup.TEAM: {
             "spawn_teammate", "activate_teammate", "list_teammates",
@@ -107,6 +111,10 @@ class ToolMatrix:
         },
         ToolGroup.BACKGROUND: {
             "background_run", "check_background"
+        },
+        ToolGroup.INTENT: {
+            "register_intent", "clarify_intent", "verify_action", 
+            "track_decision", "get_intent_status"
         },
     }
     

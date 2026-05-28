@@ -13,6 +13,7 @@ import json
 import traceback
 import asyncio
 import ast
+from pathlib import Path
 from datetime import datetime
 from nicegui import ui, app
 
@@ -32,6 +33,15 @@ try:
 except ImportError:
     print("错误: 无法导入 agent_loop.py，请确保文件在同一目录下。")
     exit(1)
+
+try:
+    from project_manager import (
+        get_project_manager, ProjectInfo, ProjectData
+    )
+    PROJECT_MANAGER_AVAILABLE = True
+except ImportError as e:
+    print(f"警告: project_manager 模块未找到: {e}")
+    PROJECT_MANAGER_AVAILABLE = False
 
 # ---------- 全局状态 ----------
 messages: list = []
@@ -85,31 +95,81 @@ def do_refresh(refresh_type: str):
 # ---------- 会话持久化 ----------
 def load_history():
     global messages, tool_calls_history, todo_items
-    saved = app.storage.user.get(STORAGE_KEY, [])
-    if saved:
-        messages = saved
-        # 从历史消息中重建工具调用列表
-        tool_calls_history = [msg for msg in messages if msg.get("role") == "tool"]
-        # 从历史消息中重建 todo 列表（找最后一个 todo 工具调用）
-        for msg in reversed(messages):
-            if msg.get("role") == "tool" and msg.get("tool_name") == "todo":
-                args = msg.get("args", {})
-                todo_data = args.get("items") or args.get("todos")
-                if isinstance(todo_data, list):
-                    todo_items = todo_data
-                break
+    
+    if PROJECT_MANAGER_AVAILABLE:
+        pm = get_project_manager()
+        current_project = pm.get_current_project()
+        
+        if current_project:
+            # 从项目管理器加载数据
+            data = pm.get_current_data()
+            messages = data.messages if data.messages else [{
+                "role": "assistant",
+                "content": "👋 你好！我是 PDM Agent，一名会主动干活的智能体。"
+            }]
+            tool_calls_history = data.tool_calls_history
+            todo_items = data.todo_items
+        else:
+            # 没有选择项目时，使用浏览器存储（向后兼容）
+            saved = app.storage.user.get(STORAGE_KEY, [])
+            if saved:
+                messages = saved
+                tool_calls_history = [msg for msg in messages if msg.get("role") == "tool"]
+                for msg in reversed(messages):
+                    if msg.get("role") == "tool" and msg.get("tool_name") == "todo":
+                        args = msg.get("args", {})
+                        todo_data = args.get("items") or args.get("todos")
+                        if isinstance(todo_data, list):
+                            todo_items = todo_data
+                        break
+            else:
+                messages = [{
+                    "role": "assistant",
+                    "content": "👋 你好！我是 PDM Agent，一名会主动干活的智能体。\n\n📁 请先选择或创建一个项目目录。"
+                }]
+                tool_calls_history = []
+                todo_items = []
     else:
-        messages = [{
-            "role": "assistant",
-            "content": "👋 你好！我是 PDM Agent，一名会主动干活的智能体。"
-        }]
-        tool_calls_history = []
-        todo_items = []
+        # 项目管理器不可用时，使用浏览器存储
+        saved = app.storage.user.get(STORAGE_KEY, [])
+        if saved:
+            messages = saved
+            tool_calls_history = [msg for msg in messages if msg.get("role") == "tool"]
+            for msg in reversed(messages):
+                if msg.get("role") == "tool" and msg.get("tool_name") == "todo":
+                    args = msg.get("args", {})
+                    todo_data = args.get("items") or args.get("todos")
+                    if isinstance(todo_data, list):
+                        todo_items = todo_data
+                    break
+        else:
+            messages = [{
+                "role": "assistant",
+                "content": "👋 你好！我是 PDM Agent，一名会主动干活的智能体。"
+            }]
+            tool_calls_history = []
+            todo_items = []
+    
     ui_chat.refresh()
     todo_panel.refresh()
     tool_calls_panel.refresh()
 
 def save_history():
+    if PROJECT_MANAGER_AVAILABLE:
+        pm = get_project_manager()
+        current_project = pm.get_current_project()
+        
+        if current_project:
+            # 保存到项目管理器
+            pm.update_current_data(
+                messages=messages,
+                tool_calls_history=tool_calls_history,
+                todo_items=todo_items
+            )
+            pm.save_current_project()
+            return
+    
+    # 向后兼容：保存到浏览器存储
     app.storage.user[STORAGE_KEY] = messages
 
 def add_user_message(content: str):
@@ -753,6 +813,265 @@ def clear_history():
     teammate_panel.refresh()
     ui.notify("会话已清空", type="info")
 
+# ---------- 项目管理相关函数 ----------
+project_dialog = None
+project_list_panel = None
+project_name_label = None
+
+def open_folder_selector(callback):
+    """打开文件夹选择对话框"""
+    with ui.dialog() as dialog, ui.card().classes("w-[500px]"):
+        ui.label("选择项目目录").classes("text-lg font-bold mb-2")
+        
+        # 常用目录快捷选择
+        ui.label("快捷选择:").classes("text-sm text-gray-500 mt-2 mb-1")
+        
+        from pathlib import Path
+        import os
+        
+        home = Path.home()
+        quick_dirs = [
+            ("桌面", home / "Desktop"),
+            ("文档", home / "Documents"),
+            ("下载", home / "Downloads"),
+        ]
+        
+        # Windows 添加更多选项
+        if os.name == 'nt':
+            quick_dirs.insert(0, ("用户目录", home))
+            # 添加常用驱动器
+            for drive in "CDEFGH":
+                drive_path = Path(f"{drive}:\\")
+                if drive_path.exists():
+                    quick_dirs.append((f"{drive}:盘", drive_path))
+        
+        with ui.row().classes("w-full gap-2 flex-wrap"):
+            for name, path in quick_dirs:
+                if path.exists():
+                    ui.button(
+                        name,
+                        on_click=lambda p=str(path): set_path_input(p)
+                    ).props("flat dense size=sm")
+        
+        ui.separator().classes("my-3")
+        
+        # 路径输入
+        ui.label("项目路径:").classes("text-sm text-gray-500 mb-1")
+        path_input = ui.input(
+            placeholder="输入或粘贴项目目录的绝对路径...",
+        ).classes("w-full").props("clearable")
+        
+        def set_path_input(p):
+            path_input.value = p
+        
+        # 路径预览
+        preview_label = ui.label().classes("text-xs text-gray-400 mt-1")
+        
+        def update_preview():
+            path = path_input.value.strip() if path_input.value else ""
+            if path:
+                p = Path(path)
+                if p.exists():
+                    preview_label.text = f"✓ 目录存在，项目名: {p.name}"
+                    preview_label.classes("text-xs text-positive mt-1", remove="text-gray-400 text-negative")
+                else:
+                    preview_label.text = "○ 目录不存在，将自动创建"
+                    preview_label.classes("text-xs text-gray-400 mt-1", remove="text-positive text-negative")
+            else:
+                preview_label.text = ""
+        
+        path_input.on("update:model-value", update_preview)
+        
+        # 提示
+        ui.label("提示: 可以在资源管理器中复制文件夹路径粘贴到此处").classes(
+            "text-xs text-gray-400 mt-2"
+        )
+        
+        with ui.row().classes("w-full justify-end gap-2 mt-4"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+            ui.button("确定", on_click=lambda: do_select(path_input.value, dialog)).props("color=primary")
+    
+    def do_select(path: str, d):
+        if not path or not path.strip():
+            ui.notify("请输入项目路径", type="warning")
+            return
+        
+        path = path.strip()
+        try:
+            p = Path(path)
+            if not p.exists():
+                p.mkdir(parents=True, exist_ok=True)
+            
+            # 调用回调
+            callback(str(p))
+            d.close()
+        except Exception as e:
+            ui.notify(f"无效的路径: {e}", type="negative")
+    
+    dialog.open()
+
+def select_project_folder():
+    """选择项目文件夹"""
+    if not PROJECT_MANAGER_AVAILABLE:
+        ui.notify("项目管理器不可用", type="warning")
+        return
+    
+    open_folder_selector(on_folder_selected)
+
+def on_folder_selected(folder_path: str):
+    """文件夹选择完成后的回调"""
+    pm = get_project_manager()
+    project_name = Path(folder_path).name
+    
+    try:
+        # 注册并切换项目（名称自动使用文件夹名）
+        pm.register_project(folder_path)
+        pm.switch_project(folder_path)
+        
+        # 重新加载历史
+        load_history()
+        
+        # 更新UI
+        update_project_display()
+        project_list_panel.refresh()
+        
+        ui.notify(f"已切换到项目: {project_name}", type="positive")
+        
+    except Exception as e:
+        ui.notify(f"切换项目失败: {e}", type="negative")
+
+def create_new_project():
+    """创建新项目（选择空目录作为新项目）"""
+    if not PROJECT_MANAGER_AVAILABLE:
+        ui.notify("项目管理器不可用", type="warning")
+        return
+    
+    open_folder_selector(on_new_project_selected)
+
+def on_new_project_selected(folder_path: str):
+    """新项目文件夹选择完成后的回调"""
+    pm = get_project_manager()
+    project_name = Path(folder_path).name
+    
+    try:
+        # 创建并切换项目
+        pm.register_project(folder_path, description="新建项目")
+        pm.switch_project(folder_path)
+        
+        # 清空历史
+        global messages, tool_calls_history, todo_items
+        messages = [{
+            "role": "assistant",
+            "content": f"📁 项目 '{project_name}' 已创建。\n\n有什么可以帮你的？"
+        }]
+        tool_calls_history = []
+        todo_items = []
+        save_history()
+        
+        # 更新UI
+        update_project_display()
+        project_list_panel.refresh()
+        ui_chat.refresh()
+        
+        ui.notify(f"项目 '{project_name}' 创建成功", type="positive")
+        
+    except Exception as e:
+        ui.notify(f"创建项目失败: {e}", type="negative")
+
+def get_current_project_name() -> str:
+    """获取当前项目名称"""
+    if PROJECT_MANAGER_AVAILABLE:
+        pm = get_project_manager()
+        project = pm.get_current_project()
+        if project:
+            return project.name
+    return "未选择项目"
+
+def get_current_project_path() -> str:
+    """获取当前项目路径"""
+    if PROJECT_MANAGER_AVAILABLE:
+        pm = get_project_manager()
+        path = pm.get_current_project_path()
+        if path:
+            return path
+    return ""
+
+def switch_to_project(project_path: str):
+    """切换到指定项目"""
+    if not PROJECT_MANAGER_AVAILABLE:
+        return
+    
+    pm = get_project_manager()
+    
+    try:
+        pm.switch_project(project_path)
+        load_history()
+        update_project_display()
+        project_list_panel.refresh()
+        ui.notify(f"已切换到项目", type="info")
+    except Exception as e:
+        ui.notify(f"切换失败: {e}", type="negative")
+
+def remove_project(project_path: str):
+    """移除项目（仅从列表移除，不删除文件）"""
+    if not PROJECT_MANAGER_AVAILABLE:
+        return
+    
+    pm = get_project_manager()
+    project = pm.get_project_info(project_path)
+    
+    if project:
+        pm.unregister_project(project_path)
+        project_list_panel.refresh()
+        ui.notify(f"项目 '{project.name}' 已从列表移除", type="info")
+
+def update_project_display():
+    """更新项目显示"""
+    global project_name_label
+    if 'project_name_label' in globals() and project_name_label:
+        project_name_label.set_text(get_current_project_name())
+
+@ui.refreshable
+def project_list_panel():
+    """项目列表面板"""
+    if not PROJECT_MANAGER_AVAILABLE:
+        ui.label("项目管理器不可用")
+        return
+    
+    pm = get_project_manager()
+    projects = pm.list_projects()
+    current = pm.get_current_project()
+    
+    ui.label("项目列表").classes("text-md font-semibold mb-2")
+    
+    if not projects:
+        ui.label("暂无项目，请创建或选择项目").classes("text-gray-400 text-sm")
+        return
+    
+    for project in projects:
+        is_current = current and project.path == current.path
+        with ui.card().classes(
+            f"w-full mb-2 transition-shadow"
+            + (" ring-2 ring-primary bg-primary/5" if is_current else " hover:shadow-md cursor-pointer")
+        ):
+            with ui.row().classes("w-full items-center justify-between"):
+                with ui.column().classes("flex-grow cursor-pointer").on(
+                    "click", 
+                    lambda p=project.path: switch_to_project(p)
+                ):
+                    ui.label(project.name).classes("font-semibold")
+                    ui.label(project.path).classes("text-xs text-gray-500 truncate")
+                    if project.description:
+                        ui.label(project.description).classes("text-xs text-gray-400")
+                with ui.row().classes("gap-1 items-center"):
+                    if is_current:
+                        ui.icon("check_circle").classes("text-primary text-xl")
+                    with ui.button(
+                        icon="delete_outline",
+                        on_click=lambda e, p=project.path: remove_project(p)
+                    ).props("flat dense round").classes("text-gray-400 hover:text-negative"):
+                        ui.tooltip("从列表移除")
+
 input_field = None
 drawer = None
 include_history = True  # 默认携带历史
@@ -770,7 +1089,7 @@ def toggle_dark_mode():
         app.storage.user['dark_mode'] = _dark_mode_ref.value
 
 def create_ui():
-    global input_field, drawer, _dark_mode_ref
+    global input_field, drawer, _dark_mode_ref, project_name_label, project_dialog
     ui.page_title("PDM Agent – 任务隔离助手")
 
     dark_mode_saved = app.storage.user.get('dark_mode', False)
@@ -850,12 +1169,33 @@ def create_ui():
     ''')
 
     with ui.header().classes("bg-primary text-white p-4"):
-        ui.label("PDM Agent").classes("text-xl font-bold")
-        ui.label("Personal Harness").classes("text-sm opacity-80")
+        with ui.row().classes("items-center gap-2"):
+            ui.label("PDM Agent").classes("text-xl font-bold")
+            ui.label("Personal Harness").classes("text-sm opacity-80")
         ui.space()
+        # 项目信息显示
+        if PROJECT_MANAGER_AVAILABLE:
+            with ui.button(on_click=lambda: project_dialog.open()).props("flat").classes("text-white").tooltip("点击选择/切换项目"):
+                with ui.row().classes("items-center gap-1"):
+                    ui.icon("folder")
+                    project_name_label = ui.label(get_current_project_name()).classes("text-sm")
         ui.button(icon="history", on_click=toggle_history).props("flat round").classes("text-white").tooltip("切换历史上下文")
         ui.button(icon="build", on_click=lambda: drawer.toggle()).props("flat round").classes("text-white").tooltip("工具DIY")
         ui.button(icon="dark_mode", on_click=toggle_dark_mode).props("flat round").classes("text-white").tooltip("切换深色模式")
+
+    # 项目管理对话框
+    with ui.dialog() as project_dialog, ui.card().classes("w-[500px] max-h-[80vh] overflow-y-auto"):
+        with ui.row().classes("w-full items-center justify-between mb-4"):
+            ui.label("项目管理").classes("text-xl font-bold")
+            ui.button(icon="close", on_click=project_dialog.close).props("flat round")
+        
+        with ui.row().classes("w-full gap-2 mb-4"):
+            ui.button("打开项目", icon="folder_open", on_click=select_project_folder).props("color=primary")
+            ui.button("新建项目", icon="create_new_folder", on_click=create_new_project).props("color=positive")
+        
+        ui.separator()
+        
+        project_list_panel()
 
     # 右侧可滑动抽屉（工具DIY区域）
     with ui.right_drawer(fixed=False, value=False).classes("bg-gray-100 dark:bg-gray-900 p-4 w-96") as drawer:

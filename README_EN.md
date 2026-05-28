@@ -1,6 +1,15 @@
 # Personal Harness
 
-**A Personal Agent Infrastructure Framework**
+**A Personal Agent Infrastructure Framework** - An AI Agent runtime foundation with project management, intent tracking, and team collaboration.
+
+## Core Features
+
+- 🎯 **Intent Management** - Ensures LLM accurately understands and follows user's ultimate goals
+- 📁 **Project Isolation** - Independent workspace, history, and task lists per project
+- 🔄 **Intelligent Workflow** - Process-driven execution by Meta Dispatcher
+- 🌳 **Worktree Support** - Git worktree task isolation with code merging and preservation
+- 👥 **Team Collaboration** - Multi-agent collaboration with message passing
+- 🛠️ **Tool Matrix** - 40+ tools with layered permission management
 
 ## Introduction
 
@@ -15,83 +24,11 @@ Every user can build their own "Agent runtime base", where the smallest building
 - Context isolation
 - Team collaboration
 - Task isolation
+- Intent management
+- Project management
 - ...
 
 Your mission is to continuously improve this base, keep adding tools, and let your Agent grow and evolve.
-
-## Core Concepts
-
-### Harness (Agent Framework)
-
-Beyond the underlying dependencies (LLM API, computing environment), an Agent needs a **framework** layer to connect the Agent with these dependencies. This layer is called **Harness**.
-
-- **General-purpose Tools**: Cross-platform core capabilities such as file I/O, context compression, skill loading, task publishing, team collaboration, etc.
-- **Application-specific Tools**: Personal tools or plugins that developers can mount on demand
-
-> The core LLM loop of this project, `agent_loop.py`, is developed and extended step by step based on "`design/01-10 完整需求文档.md`". Each `agent_loop.py` in the "`agents/`" directory strictly corresponds to the respective section in "`design/01-10 完整需求文档.md`", allowing each corresponding `agent_loop.py` to be run section by section.
-
-> At the same time, adhering to the aforementioned philosophy of "everything can be toolified", this project further extends the toolset based on "`10-agent_loop.py`", adding a new set of meta-operational tools called "process tools", and re-stratifies the hierarchy, ultimately forming the architectural shape described below.
-
-### Tool Matrix Architecture
-
-This project adopts a **Layered Tool Matrix Architecture**, with the Meta Dispatcher as the core, managing workflows through process-driven execution.
-
-```
-User Layer (Single Entry Point)
-       │
-       ▼
-  meta_dispatch (Grand Steward)
-       │
-       │ Identify paradigm, create session
-       │ Return first phase instruction
-       ▼
-  Workflow Execution
-       │
-       │ LLM calls specific tools
-       │ meta_step advances to next phase
-       ▼
-  Process Layer
-       │
-       │ CODE_DEV | TEST_EVAL | FEATURE_DESIGN
-       │ ENGINEERING | DOC_WRITING | GENERAL
-       ▼
-  Tool Matrix Layer
-       │
-       │ File | Task | Team | Workflow tools
-       │ 30+ tools, invisible to users
-       ▼
-```
-
-### User-Visible Tools
-
-Users only interact with two tools:
-
-| Tool | Purpose |
-|------|---------|
-| `meta_dispatch` | Entry point - Start workflow, returns first phase instruction |
-| `meta_step` | Advance - Move to next phase after completing current tasks |
-
-## Project Structure
-
-```
-.
-├── ready-to-use-withUI/        # Source code
-│   ├── agent_loop.py           # Core Agent loop
-│   ├── meta_dispatcher.py      # Meta dispatcher (Grand Steward)
-│   ├── process_definition.py   # Process definitions
-│   ├── tool_matrix.py          # Tool matrix
-│   └── web_ui.py               # Web interface
-├── design/                     # Design documents
-│   ├── meta_operation_architecture.md
-│   ├── meta_operation_design.md
-│   ├── tool_matrix_layer_architecture.md
-│   └── tool_matrix_layer_design.md
-├── AGENTS.md                   # Agent configuration
-├── NETWORK_GUIDE.md            # Network configuration guide
-├── README.md                   # Project entry
-├── README_CN.md                # Chinese README
-└── README_EN.md                # English README
-```
 
 ## Quick Start
 
@@ -117,12 +54,6 @@ export LLM_MODEL="your_model_name"
 
 ### Run
 
-**CLI Mode:**
-
-```bash
-python ready-to-use-withUI/agent_loop.py
-```
-
 **Web UI Mode (Recommended):**
 
 ```bash
@@ -130,16 +61,79 @@ python ready-to-use-withUI/web_ui.py
 # Visit http://localhost:8080
 ```
 
-## Web UI Features
+**CLI Mode:**
 
-- Real-time streaming output
-- Tool call visualization
-- Dark mode toggle
-- Session persistence
-- Tool DIY panel: Enable/disable built-in tools, create custom tools
-- Teammate activity panel: Multi-agent collaboration messages
+```bash
+python ready-to-use-withUI/agent_loop.py
+```
 
-## Process Types
+## Main Features
+
+### 1. Project Management
+
+Each project has an independent workspace. Switching projects automatically loads the corresponding history and task lists.
+
+```
+Project Directory/
+├── .pdm/                 # Project-specific data
+│   ├── chat_history.json # Conversation history
+│   ├── tool_calls.json   # Tool call records
+│   ├── todo.json         # Todo items
+│   ├── intent.json       # Intent records
+│   └── decisions.json    # Decision records
+└── .worktrees/          # Worktree directory
+```
+
+**Web UI Operations**:
+- Click the project name at the top to open the project management dialog
+- Select an existing project or create a new one
+- History is automatically loaded when switching projects
+
+### 2. Intent Management
+
+Before executing any design or operation, the system guides the LLM to clarify the user's ultimate goals:
+
+| Tool | Purpose |
+|------|---------|
+| `register_intent` | Register user's primary goals, secondary goals, and constraints |
+| `clarify_intent` | Request user clarification when intent is uncertain |
+| `verify_action` | Verify if action aligns with user's original intent, detect intent drift |
+| `track_decision` | Record important design decisions for traceability |
+| `get_intent_status` | Query current intent status |
+
+**Workflow**:
+1. `meta_dispatch` identifies paradigm, enters intent clarification phase if low confidence
+2. LLM calls `register_intent` to register user intent
+3. Before critical operations, call `verify_action` to verify
+4. When making important decisions, call `track_decision` to record
+
+### 3. Worktree Management
+
+Worktrees are bound to projects, supporting both Git Worktree and Fallback modes.
+
+**File Operation Tools**:
+
+| Tool | Purpose |
+|------|---------|
+| `worktree_list_files` | List files in worktree |
+| `worktree_read_file` | Read file content in worktree |
+| `worktree_copy_files` | Copy files to main project directory |
+| `worktree_sync` | Merge code to main branch (without deleting worktree) |
+
+**Code Preservation Methods**:
+
+```python
+# Recommended: Merge then delete
+worktree_remove(name="xxx", merge_to_main=True)
+
+# Sync during development
+worktree_sync(name="xxx")
+
+# Delete worktree only, keep branch
+worktree_remove(name="xxx")
+```
+
+### 4. Process Types
 
 | Process | Phases | Use Case |
 |---------|--------|----------|
@@ -149,6 +143,66 @@ python ready-to-use-withUI/web_ui.py
 | engineering | CONFIG → DEPLOY → VERIFY → DONE | Engineering deployment |
 | documentation | PLAN → WRITE → REVIEW → DONE | Documentation writing |
 | general_qa | UNDERSTAND → ANSWER → DONE | General Q&A |
+
+## Architecture
+
+```
+User Layer (Single Entry Point)
+       │
+       ▼
+  meta_dispatch (Grand Steward)
+       │
+       │ Identify paradigm, create session
+       │ Intent clarification (low confidence)
+       │ Return first phase instruction
+       ▼
+  Workflow Execution
+       │
+       │ LLM calls specific tools
+       │ Intent verification (critical operations)
+       │ meta_step advances to next phase
+       ▼
+  Process Layer
+       │
+       │ CODE_DEV | TEST_EVAL | FEATURE_DESIGN
+       │ ENGINEERING | DOC_WRITING | GENERAL
+       ▼
+  Tool Matrix Layer
+       │
+       │ File | Task | Team | Workflow | Intent
+       │ 40+ tools, layered permission management
+       ▼
+```
+
+### User-Visible Tools
+
+Users only interact with two tools:
+
+| Tool | Purpose |
+|------|---------|
+| `meta_dispatch` | Entry point - Start workflow, returns first phase instruction |
+| `meta_step` | Advance - Move to next phase after completing current tasks |
+
+## Project Structure
+
+```
+.
+├── ready-to-use-withUI/        # Source code
+│   ├── agent_loop.py           # Core Agent loop
+│   ├── meta_dispatcher.py      # Meta dispatcher (Grand Steward)
+│   ├── tool_matrix.py          # Tool matrix
+│   ├── process_definition.py   # Process definitions
+│   ├── intent_tools.py         # Intent management tools
+│   ├── project_manager.py      # Project manager
+│   └── web_ui.py               # Web interface
+├── projects.json               # Project registry
+├── AGENTS.md                   # Agent configuration
+├── NETWORK_GUIDE.md            # Network configuration guide
+├── README.md                   # Project entry
+├── README_CN.md                # Chinese README
+└── README_EN.md                # English README
+```
+> The `design/` and `agents/` directories constitute the learning path and process for building the agent_loop main agent loop. For details, refer to the requirements described in `design/`. Each chapter can independently run its corresponding agent for verification.
 
 ## Tool Overview
 
@@ -162,30 +216,32 @@ python ready-to-use-withUI/web_ui.py
 | Background | `background_run`, `check_background` | Parallel task execution |
 | Team | `spawn_teammate`, `list_teammates`, `send_message`, `read_inbox` | Multi-agent collaboration |
 | Task | `task_create`, `task_list`, `task_update` | Task board management |
-| Worktree | `worktree_create`, `worktree_run` | Git worktree management |
+| Worktree | `worktree_create`, `worktree_run`, `worktree_list_files`, `worktree_copy_files` | Git worktree management |
+| Intent | `register_intent`, `clarify_intent`, `verify_action`, `track_decision` | Intent management |
 
 ## Permission Matrix
 
 Different processes have different tool access permissions:
 
-| Process | File Tools | Task Tools | Team Tools | Workflow Tools |
-|---------|:----------:|:----------:|:----------:|:--------------:|
-| CODE_DEV | ✅ | ✅ | ✅ | ✅ |
-| TEST_EVAL | ✅ | ✅ | ❌ | ❌ |
-| FEATURE_DESIGN | ✅ | ❌ | ❌ | ❌ |
-| ENGINEERING | ✅ | ✅ | ✅ | ❌ |
-| DOC_WRITING | ✅ | ❌ | ❌ | ❌ |
-| GENERAL | ✅ | ❌ | ❌ | ❌ |
+| Process | File | Task | Team | Workflow | Intent |
+|---------|:----:|:----:|:----:|:--------:|:------:|
+| CODE_DEV | ✅ | ✅ | ✅ | ✅ | ✅ |
+| TEST_EVAL | ✅ | ✅ | ❌ | ❌ | ✅ |
+| FEATURE_DESIGN | ✅ | ❌ | ❌ | ❌ | ✅ |
+| ENGINEERING | ✅ | ✅ | ✅ | ❌ | ✅ |
+| DOC_WRITING | ✅ | ❌ | ❌ | ❌ | ✅ |
+| GENERAL | ✅ | ❌ | ❌ | ❌ | ✅ |
 
 ## Runtime Data
 
 All runtime data is stored in the following directories and can be safely deleted:
 
-- `.transcripts/` - Conversation compression records
+- `<project>/.pdm/` - Project-specific data (conversations, tasks, intents)
+- `<project>/.worktrees/` - Worktree states
 - `.tasks/` - Task board data
-- `.worktrees/` - Worktree states
 - `.team/` - Team configurations
 - `.tools/` - Custom tools
+- `.transcripts/` - Conversation compression records
 
 ## Network Configuration
 

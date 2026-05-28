@@ -39,9 +39,12 @@ except ImportError:
 
 try:
     from openai import OpenAI, APIError
+    OPENAI_AVAILABLE = True
 except ImportError:
-    print("错误: 请安装 openai 库: pip install openai")
-    sys.exit(1)
+    print("警告: 未安装 openai 库，LLM 功能将不可用。请运行: pip install openai")
+    OpenAI = None
+    APIError = None
+    OPENAI_AVAILABLE = False
 
 try:
     from dotenv import load_dotenv
@@ -66,10 +69,60 @@ except ImportError as e:
     print(f"警告: meta_dispatcher 模块未找到: {e}")
     META_DISPATCHER_AVAILABLE = False
 
+# 导入意图管理工具
+try:
+    from intent_tools import (
+        run_register_intent, run_clarify_intent, 
+        run_verify_action, run_track_decision, run_get_intent_status,
+        get_intent_manager, IntentManager
+    )
+    INTENT_TOOLS_AVAILABLE = True
+except ImportError as e:
+    print(f"警告: intent_tools 模块未找到: {e}")
+    INTENT_TOOLS_AVAILABLE = False
+
+# 导入项目管理器
+try:
+    from project_manager import (
+        get_project_manager, get_current_workdir, set_workdir,
+        ProjectManager, ProjectInfo
+    )
+    PROJECT_MANAGER_AVAILABLE = True
+except ImportError as e:
+    print(f"警告: project_manager 模块未找到: {e}")
+    PROJECT_MANAGER_AVAILABLE = False
+
 # ========== 配置常量 ==========
 DEFAULT_TIMEOUT = 120
 MAX_OUTPUT_SIZE = 50000
-WORKDIR = Path.cwd()
+
+# 动态工作目录（支持项目切换）
+# 使用函数获取当前工作目录，支持项目管理
+def get_workdir() -> Path:
+    """获取当前工作目录（支持项目管理）"""
+    if PROJECT_MANAGER_AVAILABLE:
+        return get_current_workdir()
+    return Path.cwd()
+
+# 向后兼容：WORKDIR 作为属性访问
+class _WorkdirProxy:
+    """WORKDIR 代理类，支持动态获取"""
+    def __init__(self):
+        self._fallback = Path.cwd()
+    
+    def __getattr__(self, name):
+        return getattr(get_workdir(), name)
+    
+    def __str__(self):
+        return str(get_workdir())
+    
+    def __truediv__(self, other):
+        return get_workdir() / other
+    
+    def __fspath__(self):
+        return str(get_workdir())
+
+WORKDIR = _WorkdirProxy()
 
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
@@ -175,7 +228,16 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 
-REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
+def get_repo_root() -> Path:
+    """动态获取当前项目的 git root 或工作目录"""
+    if PROJECT_MANAGER_AVAILABLE:
+        workdir = get_current_workdir()
+        repo_root = detect_repo_root(workdir)
+        return repo_root or workdir
+    return REPO_ROOT
+
+# REPO_ROOT 作为启动时的默认值
+REPO_ROOT = detect_repo_root(Path.cwd()) or Path.cwd()
 
 FORBIDDEN_FUNCS = {"open", "eval", "exec", "__import__", "compile", "globals",
             "locals", "vars", "dir", "help", "input", "raw_input"}
@@ -359,23 +421,72 @@ TASKS = TaskManager(REPO_ROOT / ".tasks")
 EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
 
 # ========== WorktreeManager: Git worktree 生命周期 + 索引 ==========
+# 支持 Git worktree 和 Fallback 两种模式
+
 class WorktreeManager:
-    def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
-        self.repo_root = repo_root
-        self.tasks = tasks
-        self.events = events
-        self.dir = repo_root / ".worktrees"
+    """
+    工作树管理器 - 支持两种模式：
+    
+    1. Git Worktree 模式：需要 git，使用 git worktree 创建隔离的工作区
+    2. Fallback 模式：不需要 git，在项目目录下创建子目录作为工作区
+    
+    工作树与项目绑定：
+    - 切换项目时，工作树也会切换
+    - 每个项目有独立的 .worktrees 目录
+    """
+    
+    def __init__(self, project_root: Path = None, tasks: TaskManager = None, events: EventBus = None):
+        # 动态获取项目根目录
+        self._project_root = project_root
+        self.tasks = tasks or TASKS
+        self.events = events or EVENTS
+        
+        # 检测 git 可用性
+        self._git_available = None
+        self._fallback_mode = False
+        
+        # 延迟初始化
+        self._initialized = False
+        self.dir = None
+        self.index_path = None
+    
+    def _ensure_initialized(self):
+        """延迟初始化，确保在正确的项目目录下"""
+        if self._initialized:
+            return
+        
+        # 获取当前项目根目录
+        if self._project_root:
+            project_root = self._project_root
+        elif PROJECT_MANAGER_AVAILABLE:
+            project_root = get_current_workdir()
+        else:
+            project_root = REPO_ROOT
+        
+        # 检测 git
+        self._git_available = self._is_git_repo(project_root)
+        
+        # 设置工作树目录
+        self.dir = project_root / ".worktrees"
         self.dir.mkdir(parents=True, exist_ok=True)
+        
         self.index_path = self.dir / "index.json"
         if not self.index_path.exists():
             self.index_path.write_text(json.dumps({"worktrees": []}, indent=2))
-        self.git_available = self._is_git_repo()
-
-    def _is_git_repo(self) -> bool:
+        
+        # 设置 fallback 模式
+        self._fallback_mode = not self._git_available
+        if self._fallback_mode:
+            print(f"\033[33m[WorktreeManager] Git 不可用，使用 Fallback 模式（子目录隔离）\033[0m")
+        
+        self._initialized = True
+    
+    def _is_git_repo(self, path: Path) -> bool:
+        """检测路径是否在 git 仓库中"""
         try:
             r = subprocess.run(
                 ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=self.repo_root,
+                cwd=path,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -385,12 +496,13 @@ class WorktreeManager:
             return False
 
     def _run_git(self, args: list[str]) -> str:
-        if not self.git_available:
-            raise RuntimeError("Not in a git repository. worktree tools require git.")
+        self._ensure_initialized()
+        if self._fallback_mode:
+            raise RuntimeError("Git not available, running in fallback mode")
         try:
             r = subprocess.run(
                 ["git", *args],
-                cwd=self.repo_root,
+                cwd=self._get_project_root(),
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -404,11 +516,28 @@ class WorktreeManager:
             return out if out else "(no output)"
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Command timed out: git {' '.join(args)}")
-
+    
+    def _get_project_root(self) -> Path:
+        """获取当前项目根目录"""
+        if self._project_root:
+            return self._project_root
+        elif PROJECT_MANAGER_AVAILABLE:
+            return get_current_workdir()
+        return REPO_ROOT
+    
+    def _get_worktrees_dir(self) -> Path:
+        """获取工作树目录"""
+        project_root = self._get_project_root()
+        worktrees_dir = project_root / ".worktrees"
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+        return worktrees_dir
+    
     def _load_index(self) -> dict:
+        self._ensure_initialized()
         return json.loads(self.index_path.read_text())
 
     def _save_index(self, data: dict):
+        self._ensure_initialized()
         self.index_path.write_text(json.dumps(data, indent=2))
 
     def _find(self, name: str) -> dict | None:
@@ -426,6 +555,7 @@ class WorktreeManager:
             raise ValueError(f"Worktree name contains invalid characters: {name}. Allowed: most characters except {''.join(invalid_chars)}")
 
     def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+        self._ensure_initialized()
         self._validate_name(name)
         if self._find(name):
             raise ValueError(f"Worktree '{name}' already exists in index")
@@ -435,33 +565,43 @@ class WorktreeManager:
         path = self.dir / name
         branch = f"wt/{name}"
 
-        # 检查分支是否已经存在
-        branch_exists = False
-        try:
-            self._run_git(["show-ref", "--verify", f"refs/heads/{branch}"])
-            branch_exists = True
-        except RuntimeError:
-            branch_exists = False
-
         self.events.emit(
             "worktree.create.before",
             task={"id": task_id} if task_id is not None else {},
             worktree={"name": name, "base_ref": base_ref},
         )
+        
         try:
-            if branch_exists:
-                # 分支已存在：直接使用该分支创建 worktree，不再创建新分支
-                self._run_git(["worktree", "add", str(path), branch])
+            if self._fallback_mode:
+                # Fallback 模式：直接创建子目录
+                path.mkdir(parents=True, exist_ok=True)
+                # 创建一个标记文件
+                (path / ".pdm_worktree").write_text(json.dumps({
+                    "name": name,
+                    "mode": "fallback",
+                    "created_at": time.time()
+                }, indent=2))
             else:
-                # 分支不存在：创建新分支
-                self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
+                # Git Worktree 模式
+                branch_exists = False
+                try:
+                    self._run_git(["show-ref", "--verify", f"refs/heads/{branch}"])
+                    branch_exists = True
+                except RuntimeError:
+                    branch_exists = False
+
+                if branch_exists:
+                    self._run_git(["worktree", "add", str(path), branch])
+                else:
+                    self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
 
             entry = {
                 "name": name,
                 "path": str(path),
-                "branch": branch,
+                "branch": branch if not self._fallback_mode else "fallback",
                 "task_id": task_id,
                 "status": "active",
+                "mode": "fallback" if self._fallback_mode else "git",
                 "created_at": time.time(),
             }
             idx = self._load_index()
@@ -477,8 +617,9 @@ class WorktreeManager:
                 worktree={
                     "name": name,
                     "path": str(path),
-                    "branch": branch,
+                    "branch": entry["branch"],
                     "status": "active",
+                    "mode": entry["mode"],
                 },
             )
             return json.dumps(entry, indent=2)
@@ -492,6 +633,7 @@ class WorktreeManager:
             raise
 
     def list_all(self) -> str:
+        self._ensure_initialized()
         idx = self._load_index()
         wts = idx.get("worktrees", [])
         if not wts:
@@ -499,19 +641,27 @@ class WorktreeManager:
         lines = []
         for wt in wts:
             suffix = f" task={wt['task_id']}" if wt.get("task_id") else ""
+            mode = wt.get("mode", "git")
             lines.append(
-                f"[{wt.get('status', 'unknown')}] {wt['name']} -> "
+                f"[{wt.get('status', 'unknown')}][{mode}] {wt['name']} -> "
                 f"{wt['path']} ({wt.get('branch', '-')}){suffix}"
             )
         return "\n".join(lines)
 
     def status(self, name: str) -> str:
+        self._ensure_initialized()
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
         path = Path(wt["path"])
         if not path.exists():
             return f"Error: Worktree path missing: {path}"
+        
+        if wt.get("mode") == "fallback" or self._fallback_mode:
+            # Fallback 模式：返回目录状态
+            files = list(path.iterdir()) if path.exists() else []
+            return f"Fallback worktree '{name}'\nPath: {path}\nFiles: {len(files)}"
+        
         r = subprocess.run(
             ["git", "status", "--short", "--branch"],
             cwd=path,
@@ -523,6 +673,7 @@ class WorktreeManager:
         return text or "Clean worktree"
 
     def run(self, name: str, command: str, timeout: int = 600) -> str:
+        self._ensure_initialized()
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
             return "Error: Dangerous command blocked"
@@ -568,17 +719,55 @@ class WorktreeManager:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
+    def remove(self, name: str, force: bool = False, complete_task: bool = False, merge_to_main: bool = False) -> str:
+        """
+        删除工作树
+        
+        Args:
+            name: 工作树名称
+            force: 强制删除（即使有未提交的更改）
+            complete_task: 是否同时完成任务
+            merge_to_main: 是否将工作树的分支合并到主分支（main/master）
+        
+        Returns:
+            操作结果信息
+        """
+        self._ensure_initialized()
         wt = self._find(name)
         if not wt:
             path_candidate = self.dir / name
             if path_candidate.exists():
                 try:
-                    self._run_git(["worktree", "remove", "--force", str(path_candidate)])
+                    if not self._fallback_mode:
+                        # 检查是否有未提交的更改
+                        r = subprocess.run(
+                            ["git", "status", "--porcelain"],
+                            cwd=path_candidate,
+                            capture_output=True,
+                            text=True,
+                            timeout=30
+                        )
+                        if r.stdout.strip() and not force:
+                            return f"Error: Worktree '{name}' has uncommitted changes. Use force=True to remove anyway."
+                        
+                        # 可选：合并到主分支
+                        merge_result = ""
+                        if merge_to_main and not self._fallback_mode:
+                            merge_result = self._merge_worktree_branch(name, wt.get("branch", f"wt/{name}"))
+                        
+                        self._run_git(["worktree", "remove", "--force", str(path_candidate)])
+                    else:
+                        import shutil
+                        shutil.rmtree(path_candidate)
+                    
                     idx = self._load_index()
                     idx["worktrees"] = [w for w in idx.get("worktrees", []) if w.get("name") != name]
                     self._save_index(idx)
-                    return f"Removed orphaned worktree '{name}' (not in index)"
+                    
+                    result = f"Removed orphaned worktree '{name}' (not in index)"
+                    if merge_result:
+                        result += f"\n{merge_result}"
+                    return result
                 except Exception as e:
                     return f"Error removing orphaned worktree '{name}': {e}"
             else:
@@ -590,11 +779,46 @@ class WorktreeManager:
             worktree={"name": name, "path": wt.get("path")},
         )
         try:
-            args = ["worktree", "remove"]
-            if force:
-                args.append("--force")
-            args.append(wt["path"])
-            self._run_git(args)
+            wt_path = Path(wt["path"])
+            merge_result = ""  # 初始化
+            
+            if not self._fallback_mode and wt.get("mode") != "fallback":
+                # Git 模式
+                # 检查是否有未提交的更改
+                if wt_path.exists():
+                    r = subprocess.run(
+                        ["git", "status", "--porcelain"],
+                        cwd=wt_path,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    if r.stdout.strip() and not force:
+                        return f"Error: Worktree '{name}' has uncommitted changes.\n\n请先在 worktree 中提交代码，或使用 force=True 强制删除。"
+                
+                # 可选：合并到主分支
+                if merge_to_main:
+                    merge_result = self._merge_worktree_branch(name, wt.get("branch", f"wt/{name}"))
+                
+                # 删除 worktree
+                args = ["worktree", "remove"]
+                if force:
+                    args.append("--force")
+                args.append(wt["path"])
+                self._run_git(args)
+                
+                if not merge_to_main:
+                    # 不合并时，保留分支但提示用户如何访问
+                    branch = wt.get("branch", f"wt/{name}")
+                    merge_result = f"\n\n💡 分支 '{branch}' 已保留。\n" \
+                                   f"要查看代码：git checkout {branch}\n" \
+                                   f"要合并到主分支：git merge {branch}"
+            else:
+                # Fallback 模式：直接删除目录
+                import shutil
+                if wt_path.exists():
+                    shutil.rmtree(wt_path)
+                merge_result = "\n(Fallback 模式：目录已删除)"
 
             if complete_task and wt.get("task_id") is not None:
                 task_id = wt["task_id"]
@@ -623,7 +847,11 @@ class WorktreeManager:
                 task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
                 worktree={"name": name, "path": wt.get("path"), "status": "removed"},
             )
-            return f"Removed worktree '{name}'"
+            
+            result = f"Removed worktree '{name}'"
+            if merge_result:
+                result += merge_result
+            return result
         except Exception as e:
             self.events.emit(
                 "worktree.remove.failed",
@@ -633,7 +861,216 @@ class WorktreeManager:
             )
             raise
 
+    def _merge_worktree_branch(self, worktree_name: str, branch: str) -> str:
+        """将 worktree 分支合并到主分支"""
+        try:
+            # 获取主分支名称
+            r = subprocess.run(
+                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+                cwd=self._get_project_root(),
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if r.returncode == 0:
+                main_branch = r.stdout.strip().replace("refs/remotes/origin/", "")
+            else:
+                # 尝试常见的默认分支名
+                for mb in ["main", "master"]:
+                    r = subprocess.run(
+                        ["git", "rev-parse", "--verify", f"refs/heads/{mb}"],
+                        cwd=self._get_project_root(),
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    if r.returncode == 0:
+                        main_branch = mb
+                        break
+                else:
+                    return f"⚠️ 无法确定主分支名称，跳过合并。分支 '{branch}' 已保留。"
+            
+            # 切换到主分支
+            self._run_git(["checkout", main_branch])
+            
+            # 合并 worktree 分支
+            self._run_git(["merge", branch, "-m", f"Merge worktree '{worktree_name}' into {main_branch}"])
+            
+            # 删除已合并的分支（可选）
+            self._run_git(["branch", "-d", branch])
+            
+            return f"✅ 已将分支 '{branch}' 合并到 '{main_branch}' 并删除分支。"
+            
+        except Exception as e:
+            return f"⚠️ 合并失败: {str(e)}\n分支 '{branch}' 已保留。您可以手动合并：git merge {branch}"
+
+    def sync_to_main(self, name: str) -> str:
+        """
+        将 worktree 的当前代码同步到主分支（不删除 worktree）
+        
+        Args:
+            name: 工作树名称
+        
+        Returns:
+            操作结果信息
+        """
+        self._ensure_initialized()
+        wt = self._find(name)
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+        
+        if self._fallback_mode or wt.get("mode") == "fallback":
+            return "Error: Fallback 模式不支持分支同步"
+        
+        wt_path = Path(wt["path"])
+        if not wt_path.exists():
+            return f"Error: Worktree path missing: {wt_path}"
+        
+        branch = wt.get("branch", f"wt/{name}")
+        return self._merge_worktree_branch(name, branch)
+    
+    def list_files(self, name: str, pattern: str = "*") -> str:
+        """
+        列出 worktree 中的文件
+        
+        Args:
+            name: 工作树名称
+            pattern: 文件匹配模式（如 "*.py", "*.js"），默认列出所有文件
+        
+        Returns:
+            文件列表
+        """
+        self._ensure_initialized()
+        wt = self._find(name)
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+        
+        wt_path = Path(wt["path"])
+        if not wt_path.exists():
+            return f"Error: Worktree path missing: {wt_path}"
+        
+        # 列出文件
+        files = list(wt_path.rglob(pattern))
+        
+        # 过滤掉 .git 目录
+        files = [f for f in files if ".git" not in str(f.relative_to(wt_path).parts)]
+        
+        # 按类型分组
+        file_list = []
+        dir_list = []
+        for f in files:
+            rel_path = f.relative_to(wt_path)
+            if f.is_file():
+                file_list.append(str(rel_path))
+            elif f.is_dir():
+                dir_list.append(str(rel_path) + "/")
+        
+        result = f"📁 Worktree: {name}\n"
+        result += f"📍 Path: {wt_path}\n\n"
+        
+        if file_list:
+            result += f"📄 文件 ({len(file_list)} 个):\n"
+            for f in sorted(file_list)[:50]:  # 最多显示50个
+                result += f"  {f}\n"
+            if len(file_list) > 50:
+                result += f"  ... 还有 {len(file_list) - 50} 个文件\n"
+        
+        return result
+    
+    def copy_to_project(self, name: str, files: List[str] = None, dest: str = ".") -> str:
+        """
+        将 worktree 中的文件复制到主项目目录
+        
+        Args:
+            name: 工作树名称
+            files: 要复制的文件列表（相对路径），为空则复制所有文件
+            dest: 目标目录（相对于主项目根目录）
+        
+        Returns:
+            操作结果
+        """
+        self._ensure_initialized()
+        import shutil
+        
+        wt = self._find(name)
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+        
+        wt_path = Path(wt["path"])
+        if not wt_path.exists():
+            return f"Error: Worktree path missing: {wt_path}"
+        
+        project_root = self._get_project_root()
+        dest_path = project_root / dest
+        dest_path.mkdir(parents=True, exist_ok=True)
+        
+        if not files:
+            # 复制所有文件
+            files = []
+            for f in wt_path.rglob("*"):
+                if f.is_file():
+                    rel_parts = f.relative_to(wt_path).parts
+                    if ".git" not in rel_parts:
+                        files.append(str(f.relative_to(wt_path)))
+        
+        copied = []
+        errors = []
+        for file_rel in files:
+            src = wt_path / file_rel
+            # 使用 Path 处理路径，确保正确处理分隔符
+            rel_path = Path(file_rel)
+            dst = dest_path / rel_path
+            try:
+                if src.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    copied.append(str(rel_path))
+            except Exception as e:
+                errors.append(f"{file_rel}: {str(e)}")
+        
+        result = f"✅ 从 worktree '{name}' 复制文件到 {dest_path}\n\n"
+        if copied:
+            result += f"已复制 {len(copied)} 个文件:\n"
+            for f in copied[:20]:
+                result += f"  ✓ {f}\n"
+            if len(copied) > 20:
+                result += f"  ... 还有 {len(copied) - 20} 个文件\n"
+        if errors:
+            result += f"\n❌ 失败 {len(errors)} 个:\n"
+            for e in errors[:10]:
+                result += f"  {e}\n"
+        
+        return result
+    
+    def get_file_content(self, name: str, file_path: str) -> str:
+        """
+        读取 worktree 中的文件内容
+        
+        Args:
+            name: 工作树名称
+            file_path: 文件相对路径
+        
+        Returns:
+            文件内容
+        """
+        self._ensure_initialized()
+        wt = self._find(name)
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+        
+        wt_path = Path(wt["path"])
+        file_full = wt_path / file_path
+        
+        if not file_full.exists():
+            return f"Error: File not found: {file_path}"
+        
+        try:
+            return file_full.read_text(encoding="utf-8")
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
     def keep(self, name: str) -> str:
+        self._ensure_initialized()
         wt = self._find(name)
         if not wt:
             return f"Error: Unknown worktree '{name}'"
@@ -657,7 +1094,37 @@ class WorktreeManager:
             },
         )
         return json.dumps(kept, indent=2) if kept else f"Error: Unknown worktree '{name}'"
+    
+    def is_fallback_mode(self) -> bool:
+        """检查是否在 fallback 模式"""
+        self._ensure_initialized()
+        return self._fallback_mode
+    
+    def get_worktree_path(self, name: str) -> Optional[Path]:
+        """获取指定 worktree 的路径"""
+        self._ensure_initialized()
+        wt = self._find(name)
+        if wt:
+            return Path(wt["path"])
+        return None
 
+
+# 全局 WorktreeManager 实例（延迟初始化）
+_WORKTREES_INSTANCE = None
+_WORKTREES_LOCK = threading.RLock()
+
+def get_worktree_manager() -> WorktreeManager:
+    """获取当前的 WorktreeManager 实例（与项目绑定）"""
+    global _WORKTREES_INSTANCE
+    with _WORKTREES_LOCK:
+        if _WORKTREES_INSTANCE is None:
+            _WORKTREES_INSTANCE = WorktreeManager()
+        else:
+            # 检查是否需要重新初始化（项目切换）
+            _WORKTREES_INSTANCE._initialized = False
+        return _WORKTREES_INSTANCE
+
+# 向后兼容
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
 
 # ========== BackgroundManager ==========
@@ -676,10 +1143,11 @@ class BackgroundManager:
 
     def _execute(self, task_id: str, command: str, timeout: int):
         try:
+            workdir = str(get_workdir())  # 确保是字符串
             if IS_WINDOWS:
-                proc = subprocess.run(["cmd.exe", "/c", command], cwd=WORKDIR, capture_output=True, text=True, timeout=timeout)
+                proc = subprocess.run(["cmd.exe", "/c", command], cwd=workdir, capture_output=True, text=True, timeout=timeout)
             else:
-                proc = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=timeout)
+                proc = subprocess.run(command, shell=True, cwd=workdir, capture_output=True, text=True, timeout=timeout)
             output = (proc.stdout + proc.stderr).strip()
             if not output:
                 output = "(无输出)"
@@ -1253,32 +1721,38 @@ class TeammateManager:
                 return f"错误: 绑定工作树失败 - {str(e)}"
         if tool_name == "worktree_create":
             try:
-                return WORKTREES.create(args["name"], args.get("task_id"), args.get("base_ref", "HEAD"))
+                wt = get_worktree_manager()
+                return wt.create(args["name"], args.get("task_id"), args.get("base_ref", "HEAD"))
             except Exception as e:
                 return f"错误: 创建工作树失败 - {str(e)}"
         if tool_name == "worktree_list":
             try:
-                return WORKTREES.list_all()
+                wt = get_worktree_manager()
+                return wt.list_all()
             except Exception as e:
                 return f"错误: 列出工作树失败 - {str(e)}"
         if tool_name == "worktree_status":
             try:
-                return WORKTREES.status(args["name"])
+                wt = get_worktree_manager()
+                return wt.status(args["name"])
             except Exception as e:
                 return f"错误: 获取工作树状态失败 - {str(e)}"
         if tool_name == "worktree_run":
             try:
-                return WORKTREES.run(args["name"], args["command"])
+                wt = get_worktree_manager()
+                return wt.run(args["name"], args["command"])
             except Exception as e:
                 return f"错误: 在工作树中运行命令失败 - {str(e)}"
         if tool_name == "worktree_keep":
             try:
-                return WORKTREES.keep(args["name"])
+                wt = get_worktree_manager()
+                return wt.keep(args["name"])
             except Exception as e:
                 return f"错误: 保留工作树失败 - {str(e)}"
         if tool_name == "worktree_remove":
             try:
-                return WORKTREES.remove(args["name"], args.get("force", False), args.get("complete_task", False))
+                wt = get_worktree_manager()
+                return wt.remove(args["name"], args.get("force", False), args.get("complete_task", False))
             except Exception as e:
                 return f"错误: 删除工作树失败 - {str(e)}"
         if tool_name == "worktree_events":
@@ -1764,9 +2238,36 @@ def _make_base_tools():
     registry.register("worktree_keep", "保留工作树",
         {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
         lambda **kw: run_worktree_keep(kw["name"]), builtin=True, editable=False)
-    registry.register("worktree_remove", "删除工作树，可选完成任务",
-        {"type": "object", "properties": {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, "required": ["name"]},
-        lambda **kw: run_worktree_remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)), builtin=True, editable=False)
+    registry.register("worktree_remove", "删除工作树。重要：使用 merge_to_main=True 可将代码合并到主分支，避免代码丢失！",
+        {"type": "object", "properties": {
+            "name": {"type": "string", "description": "工作树名称"},
+            "force": {"type": "boolean", "description": "强制删除（即使有未提交更改）", "default": False},
+            "complete_task": {"type": "boolean", "description": "同时完成任务", "default": False},
+            "merge_to_main": {"type": "boolean", "description": "将分支合并到主分支（推荐！代码不会丢失）", "default": False}
+        }, "required": ["name"]},
+        lambda **kw: run_worktree_remove(kw["name"], kw.get("force", False), kw.get("complete_task", False), kw.get("merge_to_main", False)), builtin=True, editable=False)
+    registry.register("worktree_sync", "将工作树的代码合并到主分支（不删除工作树，适合开发过程中同步代码）",
+        {"type": "object", "properties": {"name": {"type": "string", "description": "工作树名称"}}, "required": ["name"]},
+        lambda **kw: run_worktree_sync(kw["name"]), builtin=True, editable=False)
+    registry.register("worktree_list_files", "列出工作树中的所有文件（查看生成了哪些代码）",
+        {"type": "object", "properties": {
+            "name": {"type": "string", "description": "工作树名称"},
+            "pattern": {"type": "string", "description": "文件匹配模式，如 *.py, *.js，默认 * 表示所有文件", "default": "*"}
+        }, "required": ["name"]},
+        lambda **kw: run_worktree_list_files(kw["name"], kw.get("pattern", "*")), builtin=True, editable=False)
+    registry.register("worktree_copy_files", "将工作树中的文件复制到主项目目录（获取生成的代码）",
+        {"type": "object", "properties": {
+            "name": {"type": "string", "description": "工作树名称"},
+            "files": {"type": "array", "items": {"type": "string"}, "description": "要复制的文件列表（相对路径），为空则复制所有文件"},
+            "dest": {"type": "string", "description": "目标目录（相对于主项目根目录）", "default": "."}
+        }, "required": ["name"]},
+        lambda **kw: run_worktree_copy_files(kw["name"], kw.get("files"), kw.get("dest", ".")), builtin=True, editable=False)
+    registry.register("worktree_read_file", "读取工作树中的文件内容",
+        {"type": "object", "properties": {
+            "name": {"type": "string", "description": "工作树名称"},
+            "file_path": {"type": "string", "description": "文件相对路径"}
+        }, "required": ["name", "file_path"]},
+        lambda **kw: run_worktree_read_file(kw["name"], kw["file_path"]), builtin=True, editable=False)
     registry.register("worktree_events", "查看工作树生命周期事件",
         {"type": "object", "properties": {"limit": {"type": "integer"}}},
         lambda **kw: run_worktree_events(kw.get("limit", 20)), builtin=True, editable=False)
@@ -1810,6 +2311,72 @@ def _make_base_tools():
         registry.register("meta_list", "列出所有可用的流程",
             {"type": "object", "properties": {}},
             lambda **kw: run_meta_list(), builtin=True, editable=False)
+    
+    # 意图管理工具组 (核心：确保LLM准确理解并遵循用户最终目的)
+    if INTENT_TOOLS_AVAILABLE:
+        # 注册用户意图
+        registry.register("register_intent",
+            "【重要】注册用户的最终目的。在开始任何设计和执行之前，必须调用此工具明确用户的主要目标、次要目标和约束条件。",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string", "description": "会话ID（从 meta_dispatch 获取）"},
+                "primary_goals": {"type": "array", "items": {"type": "string"}, "description": "主要目标列表（必须达成）"},
+                "secondary_goals": {"type": "array", "items": {"type": "string"}, "description": "次要目标列表（可选）"},
+                "constraints": {"type": "array", "items": {"type": "string"}, "description": "约束条件列表（不可违背）"},
+                "original_query": {"type": "string", "description": "用户原始query"},
+                "paradigm": {"type": "string", "description": "范式类型"}
+            }, "required": ["session_id", "primary_goals"]},
+            lambda **kw: run_register_intent(
+                kw["session_id"], kw["primary_goals"], 
+                kw.get("secondary_goals"), kw.get("constraints"),
+                kw.get("original_query", ""), kw.get("paradigm", "")
+            ), builtin=True, editable=False)
+        
+        # 澄清用户意图
+        registry.register("clarify_intent",
+            "【交互】当不确定用户意图时，生成澄清问题请用户回答。用于消除歧义。",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string", "description": "会话ID"},
+                "question": {"type": "string", "description": "需要澄清的问题"},
+                "options": {"type": "array", "items": {"type": "string"}, "description": "可选的答案选项列表"}
+            }, "required": ["session_id", "question"]},
+            lambda **kw: run_clarify_intent(kw["session_id"], kw["question"], kw.get("options")),
+            builtin=True, editable=False)
+        
+        # 验证操作是否符合意图
+        registry.register("verify_action",
+            "【验证】在执行关键/特定操作前，验证该操作是否符合用户初衷。如果操作与主要目标关联度低或违反约束，会返回警告。",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string", "description": "会话ID"},
+                "action": {"type": "string", "description": "要执行的操作名称/内容"},
+                "action_description": {"type": "string", "description": "操作的详细描述"},
+                "action_type": {"type": "string", "description": "操作类型 (tool_call, design_decision, code_change 等)", "default": "tool_call"}
+            }, "required": ["session_id", "action"]},
+            lambda **kw: run_verify_action(
+                kw["session_id"], kw["action"],
+                kw.get("action_description", ""), kw.get("action_type", "tool_call")
+            ), builtin=True, editable=False)
+        
+        # 记录设计决策
+        registry.register("track_decision",
+            "【记录】记录重要的设计决策和原因。用于后续验证和回溯。",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string", "description": "会话ID"},
+                "decision": {"type": "string", "description": "做出的决策"},
+                "reason": {"type": "string", "description": "决策原因"},
+                "alternatives": {"type": "array", "items": {"type": "string"}, "description": "考虑过的其他方案"}
+            }, "required": ["session_id", "decision", "reason"]},
+            lambda **kw: run_track_decision(
+                kw["session_id"], kw["decision"], kw["reason"], kw.get("alternatives")
+            ), builtin=True, editable=False)
+        
+        # 获取意图状态
+        registry.register("get_intent_status",
+            "【查询】获取会话的意图状态和已注册的目标信息。",
+            {"type": "object", "properties": {
+                "session_id": {"type": "string", "description": "会话ID"}
+            }, "required": ["session_id"]},
+            lambda **kw: run_get_intent_status(kw["session_id"]),
+            builtin=True, editable=False)
 
 # 创建全局注册表实例
 registry = ToolRegistry()
@@ -1819,8 +2386,10 @@ registry = ToolRegistry()
 
 # ========== 辅助函数 ==========
 def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
+    """安全路径处理，确保路径在工作目录内"""
+    workdir = get_workdir()  # 使用函数获取，确保是 Path 对象
+    path = (workdir / p).resolve()
+    if not path.is_relative_to(workdir):
         raise ValueError(f"路径逃逸工作目录: {p}")
     return path
 
@@ -1851,19 +2420,44 @@ def run_bash(command: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[str, Optiona
     else:
         shell_cmd = command
         use_shell = True
+    
+    workdir = str(get_workdir())  # 确保是字符串
     try:
         if use_shell:
-            result = subprocess.run(shell_cmd, shell=True, cwd=WORKDIR,
-                                    capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(shell_cmd, shell=True, cwd=workdir,
+                                    capture_output=True, text=True, 
+                                    encoding='utf-8', errors='replace',
+                                    timeout=timeout)
         else:
-            result = subprocess.run(shell_cmd, shell=False, cwd=WORKDIR,
-                                    capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(shell_cmd, shell=False, cwd=workdir,
+                                    capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace',
+                                    timeout=timeout)
         output = (result.stdout + result.stderr).strip()
         if not output:
             output = "(无输出)"
         if len(output) > MAX_OUTPUT_SIZE:
             output = output[:MAX_OUTPUT_SIZE] + f"\n...[输出已截断]"
         return output, None
+    except UnicodeDecodeError:
+        # 如果 UTF-8 失败，尝试 GBK（Windows 中文环境）
+        try:
+            if use_shell:
+                result = subprocess.run(shell_cmd, shell=True, cwd=workdir,
+                                        capture_output=True, text=True,
+                                        encoding='gbk', errors='replace',
+                                        timeout=timeout)
+            else:
+                result = subprocess.run(shell_cmd, shell=False, cwd=workdir,
+                                        capture_output=True, text=True,
+                                        encoding='gbk', errors='replace',
+                                        timeout=timeout)
+            output = (result.stdout + result.stderr).strip()
+            if not output:
+                output = "(无输出)"
+            return output, None
+        except Exception as e:
+            return "", f"编码错误: {str(e)}"
     except subprocess.TimeoutExpired:
         return "", f"命令执行超时 ({timeout}秒)"
     except FileNotFoundError:
@@ -1896,6 +2490,9 @@ def run_write(path: str, content: str) -> Tuple[str, Optional[str]]:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
+        # 处理可能被转义的换行符和制表符
+        # 当 LLM 通过 JSON 传递时，可能会把 "\n" 变成字面的 \n
+        content = content.replace('\\n', '\n').replace('\\t', '\t')
         fp.write_text(content, encoding='utf-8')
         return f"已写入 {len(content)} 字节到 {path}", None
     except Exception as e:
@@ -1907,6 +2504,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> Tuple[str, Optional[str
         if not fp.exists():
             return "", f"文件不存在: {path}"
         content = fp.read_text(encoding='utf-8', errors='replace')
+        
+        # 处理可能被转义的换行符和制表符
+        old_text = old_text.replace('\\n', '\n').replace('\\t', '\t')
+        new_text = new_text.replace('\\n', '\n').replace('\\t', '\t')
+        
         if old_text not in content:
             return "", f"在文件 {path} 中未找到要替换的文本"
         new_content = content.replace(old_text, new_text, 1)
@@ -2019,22 +2621,111 @@ def run_task_bind_worktree(task_id: int, worktree: str, owner: str = "") -> Tupl
     return TASKS.bind_worktree(task_id, worktree, owner), None
 
 def run_worktree_create(name: str, task_id: int = None, base_ref: str = "HEAD") -> Tuple[str, Optional[str]]:
-    return WORKTREES.create(name, task_id, base_ref), None
+    try:
+        wt = get_worktree_manager()
+        return wt.create(name, task_id, base_ref), None
+    except Exception as e:
+        return "", f"创建工作树失败: {str(e)}"
 
 def run_worktree_list() -> Tuple[str, Optional[str]]:
-    return WORKTREES.list_all(), None
+    try:
+        wt = get_worktree_manager()
+        return wt.list_all(), None
+    except Exception as e:
+        return "", f"列出工作树失败: {str(e)}"
 
 def run_worktree_status(name: str) -> Tuple[str, Optional[str]]:
-    return WORKTREES.status(name), None
+    try:
+        wt = get_worktree_manager()
+        return wt.status(name), None
+    except Exception as e:
+        return "", f"获取工作树状态失败: {str(e)}"
 
 def run_worktree_run(name: str, command: str) -> Tuple[str, Optional[str]]:
-    return WORKTREES.run(name, command), None
+    try:
+        wt = get_worktree_manager()
+        return wt.run(name, command), None
+    except Exception as e:
+        return "", f"运行命令失败: {str(e)}"
 
 def run_worktree_keep(name: str) -> Tuple[str, Optional[str]]:
-    return WORKTREES.keep(name), None
+    try:
+        wt = get_worktree_manager()
+        return wt.keep(name), None
+    except Exception as e:
+        return "", f"保留工作树失败: {str(e)}"
 
-def run_worktree_remove(name: str, force: bool = False, complete_task: bool = False) -> Tuple[str, Optional[str]]:
-    return WORKTREES.remove(name, force, complete_task), None
+def run_worktree_remove(name: str, force: bool = False, complete_task: bool = False, merge_to_main: bool = False) -> Tuple[str, Optional[str]]:
+    """
+    删除工作树
+    
+    Args:
+        name: 工作树名称
+        force: 强制删除（即使有未提交的更改）
+        complete_task: 是否同时完成任务
+        merge_to_main: 是否将分支合并到主分支（推荐True，这样代码不会丢失）
+    """
+    try:
+        wt = get_worktree_manager()
+        return wt.remove(name, force, complete_task, merge_to_main), None
+    except Exception as e:
+        return "", f"删除工作树失败: {str(e)}"
+
+def run_worktree_sync(name: str) -> Tuple[str, Optional[str]]:
+    """
+    将工作树的代码同步到主分支（不删除工作树）
+    
+    Args:
+        name: 工作树名称
+    """
+    try:
+        wt = get_worktree_manager()
+        return wt.sync_to_main(name), None
+    except Exception as e:
+        return "", f"同步失败: {str(e)}"
+
+def run_worktree_list_files(name: str, pattern: str = "*") -> Tuple[str, Optional[str]]:
+    """
+    列出工作树中的所有文件
+    
+    Args:
+        name: 工作树名称
+        pattern: 文件匹配模式（如 "*.py", "*.js"），默认列出所有
+    """
+    try:
+        wt = get_worktree_manager()
+        return wt.list_files(name, pattern), None
+    except Exception as e:
+        return "", f"列出文件失败: {str(e)}"
+
+def run_worktree_copy_files(name: str, files: List[str] = None, dest: str = ".") -> Tuple[str, Optional[str]]:
+    """
+    将工作树中的文件复制到主项目目录
+    
+    Args:
+        name: 工作树名称
+        files: 要复制的文件列表（相对路径），为空则复制所有
+        dest: 目标目录（相对于主项目根目录）
+    """
+    try:
+        wt = get_worktree_manager()
+        return wt.copy_to_project(name, files, dest), None
+    except Exception as e:
+        return "", f"复制文件失败: {str(e)}"
+
+def run_worktree_read_file(name: str, file_path: str) -> Tuple[str, Optional[str]]:
+    """
+    读取工作树中的文件内容
+    
+    Args:
+        name: 工作树名称
+        file_path: 文件相对路径
+    """
+    try:
+        wt = get_worktree_manager()
+        return wt.get_file_content(name, file_path), None
+    except Exception as e:
+        return "", f"读取文件失败: {str(e)}"
 
 def run_worktree_events(limit: int = 20) -> Tuple[str, Optional[str]]:
     return EVENTS.list_recent(limit), None
@@ -2117,8 +2808,13 @@ def get_dynamic_system_prompt() -> str:
     tools_list = registry.list_tools()
     enabled_tools = [t["name"] for t in tools_list if t["enabled"]]
     tools_desc = ", ".join(enabled_tools) if enabled_tools else "无"
-    return f"""你是一个智能助手（团队领导，名为 lead ），当前工作目录: {WORKDIR}，操作系统: {OS_INFO}。
-Git 仓库根目录: {REPO_ROOT} (如果为空则不支持 worktree)。创建分支时，如分支已存在，则复用。
+    
+    # 获取当前工作目录（确保是字符串）
+    workdir_str = str(get_workdir())
+    repo_root_str = str(get_repo_root()) if REPO_ROOT else "无"
+    
+    return f"""你是一个智能助手（团队领导，名为 lead ），当前工作目录: {workdir_str}，操作系统: {OS_INFO}。
+Git 仓库根目录: {repo_root_str} (如果为空则不支持 worktree)。创建分支时，如分支已存在，则复用。
 
 当前启用的工具: {tools_desc}
 
@@ -2194,8 +2890,12 @@ LLM:
 **任务隔离工作流**：
 - 当你需要处理一个可能与其他工作冲突的任务时，先为该任务创建一个独立的工作树：worktree_create name=短名称 task_id=<任务ID>
 - 在工作树内执行命令、修改文件：worktree_run name=短名称 command="..."
-- 任务完成后，清理工作树并自动将任务标记为完成：worktree_remove name=短名称 complete_task=true
+- **【重要】任务完成后，必须保留代码**：
+  - 方式1（推荐）：worktree_remove name=短名称 merge_to_main=true - 将代码合并到主分支后删除工作树
+  - 方式2：worktree_sync name=短名称 - 仅合并代码，保留工作树继续开发
+  - 方式3：worktree_remove name=短名称 - 删除工作树但保留分支，后续可用 git checkout wt/短名称 访问
 - 如果需要保留工作树以供后续使用，使用 worktree_keep
+- **警告**：直接删除工作树而不合并代码会导致代码难以访问！
 
 **任务发布工作流**：
 - 当你需要发布任务给其它队员，先检查队友状态，如果是 shutdown，需要先使用 activate_teammate 激活
@@ -2218,6 +2918,9 @@ LLM:
 # ========== 多模型客户端 ==========
 class MultiModelClient:
     def __init__(self):
+        if not OPENAI_AVAILABLE:
+            raise ValueError("openai 库未安装，无法使用 LLM 功能。请运行: pip install openai")
+        
         api_base = os.getenv("LLM_API_BASE")
         api_key = os.getenv("API_KEY") or os.getenv("LLM_API_KEY")  # 兼容两种变量名
         self.model = os.getenv("LLM_MODEL")
